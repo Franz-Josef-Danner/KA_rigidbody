@@ -1,14 +1,198 @@
-# KA Rigid Dynamics 0.5.1
+# KA Destruction Suite – Gemeinsame Entwicklungsdokumentation
 
-Native Rigid-Body-Simulation und Entwicklungsgrundlage für ein zukünftiges, gekoppeltes Zerstörungs-, Partikel-, Staub-, Rauch- und Feuersystem in Blender.
+**Dokumentationsstand:** 17. Juli 2026  
+**Geltungsbereich:** KA Simulation Core, KA Fracture, KA Rigid Dynamics, KA Particles, KA Volumes und KA Destruction Suite
 
-> **Wichtige Abgrenzung:** Version 0.5.1 enthält aktuell Jolt/Culverin für Rigid Bodies, CoACD für Compound-Convex-Collider und einen binären Transform-Cache. PhysX, Blast, PBD-Partikel, NVIDIA Flow, Rauch und Feuer sind in dieser Version noch nicht implementiert. Die folgenden Kapitel dokumentieren die geplante Zielarchitektur und die Entwicklungsreihenfolge.
+Diese README ist das gemeinsame Entwicklungs- und Architektur-Dokument der gesamten KA-Simulationsfamilie. Dieselbe Datei soll in jedem Teil-Add-on mitgeführt werden, damit Zielarchitektur, Schnittstellen, Entwicklungsreihenfolge und Forschungsgrundlage nicht auseinanderlaufen.
 
-Die bisherige Versionshistorie wurde in [`CHANGELOG.md`](CHANGELOG.md) ausgelagert. Die technische Ist-Architektur steht in [`ARCHITECTURE.md`](ARCHITECTURE.md).
+> **Wichtige Abgrenzung:** Die einzelnen Add-ons werden zunächst unabhängig entwickelt, installiert und getestet. Das abschließende Sammel-Add-on koordiniert sie zu einem Gesamtworkflow. Es soll die Quellcodes nicht unkontrolliert zu einem Monolithen verschmelzen. Eine spätere gemeinsame Suite-Auslieferung kann alle Module bündeln, intern bleiben die Verantwortlichkeiten und Schnittstellen jedoch getrennt.
+
+> **Aktueller Implementierungsstand:** KA Rigid Dynamics 0.5.1 enthält Jolt/Culverin für Rigid Bodies, CoACD für Compound-Convex-Collider und einen binären Transform-Cache. PhysX, Blast, PBD-Partikel, NVIDIA Flow, Rauch und Feuer sind noch nicht implementiert. KA Fracture wird als eigenständiges Add-on entwickelt. KA Simulation Core, KA Particles, KA Volumes und das koordinierende Suite-Add-on sind geplante beziehungsweise aufzubauende Module.
+
+In jedem Einzel-Add-on bleiben `ARCHITECTURE.md` und `CHANGELOG.md` modulspezifisch. Diese gemeinsame `README.md` beschreibt dagegen das Gesamtsystem und soll möglichst identisch gehalten werden.
 
 ---
 
-## 1. Projektziel
+## 1. Entwicklungs- und Dokumentationsstrategie
+
+Das Gesamtsystem wird nicht als ein einziges großes Add-on begonnen. Die Funktionsbereiche werden zunächst als eigenständige Add-ons entwickelt:
+
+1. **KA Fracture** – Fragmentierung und Destruction-Asset-Erzeugung.
+2. **KA Rigid Dynamics** – Rigid Bodies, Kollision, Zusammenhalt, Schaden und Ereignisse.
+3. **KA Particles** – Splitter, Granulat und grobe Staubpartikel.
+4. **KA Volumes** – feiner Staub, Rauch, Feuer und andere volumetrische Fluideffekte.
+5. **KA Destruction Suite** – gemeinsamer Workflow, zentrale UI und koordinierter Bake.
+
+Zusätzlich wird ein kleines gemeinsames Fundament benötigt:
+
+6. **KA Simulation Core** – Datenverträge, IDs, Materialprofile, Ereignisschema, Cache-Metadaten und Versionsprüfung.
+
+Die Einzel-Add-ons müssen auch separat nutzbar bleiben. Das spätere Sammel-Add-on verbindet sie über definierte Schnittstellen und gemeinsame Daten, nicht über kopierte Klassen oder direkte Zugriffe auf interne Implementierungsdetails.
+
+### Regeln für diese gemeinsame README
+
+- Die gemeinsame README wird in allen Modulen mit demselben Dokumentationsstand gespeichert.
+- Änderungen an der Gesamtarchitektur werden zuerst in dieser Master-Datei vorgenommen und anschließend in alle Module übernommen.
+- Modulspezifische Bedienung, Implementierungsdetails und bekannte Fehler gehören in die jeweilige `ARCHITECTURE.md`, `CHANGELOG.md` oder eine zusätzliche Modul-Dokumentation.
+- Noch nicht implementierte Funktionen werden ausdrücklich als geplant markiert.
+- Eine Dokumentationsänderung allein erhöht nicht zwingend die Funktionsversion eines Add-ons.
+
+---
+
+## 2. Add-on-Familie und Verantwortlichkeiten
+
+### 2.1 KA Simulation Core
+
+Der Core enthält keine eigentliche Simulation und möglichst keine umfangreiche Benutzeroberfläche. Er definiert die gemeinsamen Verträge:
+
+- stabile Szenen-, Objekt-, Body-, Fragment-, Bond-, Material- und Event-IDs,
+- SI-Einheiten und Koordinatenkonventionen,
+- `DestructionAsset`-, `SimulationScene`- und `SimulationEvent`-Schemata,
+- Material- und Schadensprofile,
+- Cache-Manifest und Abhängigkeitsgraph,
+- Versions- und Kompatibilitätsprüfung,
+- Logging- und Diagnose-Schnittstellen,
+- Registrierung verfügbarer Module und Fähigkeiten.
+
+Der Core darf keine zwingende Abhängigkeit von Jolt, PhysX, Blast, CoACD, Flow oder einer bestimmten UI besitzen.
+
+### 2.2 KA Fracture
+
+Zuständig für:
+
+- Point-, Voronoi-, Boolean- und Cut-Fracturing,
+- Bruchflächen, Innen-/Außenflächen, Materialien und UVs,
+- Rough-, Polish- und High-Resolution-Oberflächen,
+- hierarchische Fragmentierung,
+- stabile Fragment-IDs,
+- Nachbarschafts- und gemeinsame Flächenerkennung,
+- Low-Poly-Collision-Proxys,
+- Export eines solverunabhängigen Destruction Assets.
+
+KA Fracture berechnet keine eigentliche dynamische Zerstörung. Es erzeugt die Geometrie und die strukturellen Ausgangsdaten.
+
+### 2.3 KA Rigid Dynamics
+
+Zuständig für:
+
+- Rigid-Body-Simulation,
+- Jolt und später PhysX als austauschbare Backends,
+- Convex Hull, Compound Convex und statische Mesh-Collider,
+- Masse, Trägheit, Reibung, Restitution, Dämpfung und CCD,
+- Constraints und später Bond-/Blast-basierte Zusammenhaltung,
+- Kontakt-, Aufprall-, Gleit-, Trennungs- und Bruchereignisse,
+- Transform-, Zustands- und Event-Cache.
+
+KA Rigid Dynamics muss auch mit beliebigen Blender-Objekten ohne KA Fracture funktionieren. Liegt ein standardisiertes Destruction Asset vor, nutzt es dessen Fragment- und Bond-Daten.
+
+### 2.4 KA Particles
+
+Zuständig für:
+
+- sekundäre kleine Rigid-Body-Splitter,
+- Sand, Kies, Granulat und grobes Pulver,
+- schwere und repräsentative Staubpartikel,
+- material- und ereignisabhängige Emission,
+- PhysX-PBD oder einen alternativen Partikelsolver,
+- Lebensdauer, Sleeping, LOD und Partikelcache,
+- manuelle Emitter unabhängig vom Destruction-System.
+
+KA Particles verarbeitet den gemeinsamen Event Stream. Es greift nicht direkt auf interne Jolt- oder PhysX-Klassen von KA Rigid Dynamics zu.
+
+### 2.5 KA Volumes
+
+Arbeitsname für das getrennte Fluid-/Volumen-Add-on. Zuständig für:
+
+- feinen luftgetragenen Staub,
+- Rauch,
+- Feuer,
+- Dichte-, Geschwindigkeits-, Temperatur-, Brennstoff- und Verbrennungsfelder,
+- Turbulenz, Auftrieb, Luftwiderstand und Sinkverhalten,
+- NVIDIA Flow oder einen alternativen Sparse-Volume-Solver,
+- OpenVDB-/NanoVDB-Ausgabe und Volume-Cache.
+
+Echte Flüssigkeiten können später als eigener Bereich oder eigenes Modul ergänzt werden. Staub, Rauch und Feuer werden zunächst als gasförmige beziehungsweise volumetrische Fluide behandelt.
+
+### 2.6 KA Destruction Suite
+
+Das Sammel-Add-on koordiniert die vorhandenen Module:
+
+- gemeinsame Benutzeroberfläche,
+- Workflow von Fracture über Rigid Dynamics zu Particles und Volumes,
+- Material- und Qualitäts-Presets,
+- Modul- und Versionsprüfung,
+- gemeinsamer Bake-Plan,
+- Cache-Abhängigkeiten und Invalidierung,
+- Fortschrittsanzeige, Fehlerprüfung und Diagnoseübersicht,
+- Übergabe standardisierter Daten zwischen den Modulen.
+
+Das Suite-Add-on darf fehlende Module erkennen und den verbleibenden Workflow weiterhin nutzbar halten. Beispiel: Fracture und Rigid Dynamics müssen auch ohne Particles und Volumes funktionieren.
+
+---
+
+## 3. Abhängigkeits- und Integrationsmodell
+
+Die gewünschte Abhängigkeitsrichtung lautet:
+
+```text
+                    KA Simulation Core
+                  gemeinsame Datenverträge
+                            ↑
+        ┌───────────────────┼───────────────────┐
+        │                   │                   │
+   KA Fracture       KA Rigid Dynamics    KA Particles
+        │                   │                   │
+        └────────────── Event/Asset ────────────┤
+                                                │
+                                           KA Volumes
+
+                    KA Destruction Suite
+             koordiniert alle installierten Module
+```
+
+Praktisch dürfen alle Funktionsmodule den Core verwenden. Sie sollten sich untereinander möglichst nur über serialisierbare Core-Daten austauschen.
+
+### Erlaubte Kopplung
+
+- KA Fracture schreibt ein `DestructionAsset`.
+- KA Rigid Dynamics liest dieses Asset und schreibt `SimulationEvent`- und Rigid-Cache-Daten.
+- KA Particles liest Events und schreibt Partikel-Cache-Daten.
+- KA Volumes liest Events und optional Partikeldaten und schreibt VDB-Cache-Daten.
+- KA Destruction Suite erstellt und überwacht den gesamten Abhängigkeitsgraphen.
+
+### Zu vermeidende Kopplung
+
+- direkte Imports interner UI-Klassen eines anderen Add-ons,
+- Zugriff auf private Solverobjekte eines anderen Moduls,
+- Datenaustausch ausschließlich über Blender-Objektnamen,
+- mehrfach implementierte Material- oder Eventklassen,
+- gemeinsame globale Zustände ohne Versionierung,
+- Kopieren desselben Solvercodes in mehrere Add-ons.
+
+### Gemeinsames Ereignisbeispiel
+
+```json
+{
+  "schema": "ka.simulation_event/1",
+  "event_id": "event_000042",
+  "event_type": "BOND_BREAK",
+  "frame": 42,
+  "time_seconds": 1.68,
+  "position_m": [1.2, 0.4, 2.8],
+  "fragment_a": "fragment_0012",
+  "fragment_b": "fragment_0013",
+  "material_id": "concrete_default",
+  "energy_j": 38.5,
+  "released_area_m2": 0.027,
+  "relative_velocity_m_s": 4.8
+}
+```
+
+Dasselbe Ereignis kann neue Rigid Bodies aktivieren, Splitter erzeugen, granulare Partikel emittieren, eine Staubwolke speisen und später Audio- oder Kameraeffekte auslösen.
+
+---
+
+## 4. Projektziel und Gesamtpipeline
 
 Das langfristige System soll eine durchgängige Destruction-Pipeline bereitstellen:
 
@@ -26,32 +210,41 @@ Das langfristige System soll eine durchgängige Destruction-Pipeline bereitstell
 Die angestrebte Gesamtpipeline lautet:
 
 ```text
-KA Fracture / Geometry Authoring
+KA Fracture
+Geometrie + Fragmente + Bruchflächen + Proxys
         ↓
-Destruction Asset
-Fragmente + Collider + Nachbarschaften + Bonds + Materialien
+KA Simulation Core
+Destruction Asset + IDs + Materialien + Bonds
         ↓
-Simulation Core
+KA Rigid Dynamics
 PhysX/Blast als geplanter Hauptpfad, Jolt als CPU-Fallback
         ↓
 Solverunabhängiger Event Stream
 Bruch + Aufprall + Trennung + Reibung + Energie
-        ↓
-Sekundärsimulationen
-Rigid Debris + granulare PBD-Partikel + Staubemission
-        ↓
-Sparse Volume Simulation
-Staub + Rauch + Feuer
-        ↓
-Blender Cache und Rendering
-Transforme + Partikel + Events + OpenVDB/NanoVDB
+        ├───────────────────────┐
+        ↓                       ↓
+KA Particles               KA Volumes
+Splitter + Granulat        Staub + Rauch + Feuer
+        └───────────┬───────────┘
+                    ↓
+KA Destruction Suite
+Bake-Steuerung + Cache + Playback + Diagnose
 ```
 
 ---
 
-## 2. Aktueller Stand von Version 0.5.1
+## 5. Statusübersicht der Module
 
-### Bereits vorhanden
+| Modul | Status zum Dokumentationsstand | Hauptaufgabe |
+|---|---|---|
+| KA Simulation Core | geplant / zu definieren | gemeinsame Datenverträge und Cache-Schemata |
+| KA Fracture | eigenständige aktive Entwicklung | Geometrie, Fragmente und Destruction Asset |
+| KA Rigid Dynamics | Version 0.5.1 vorhanden | Jolt-Rigid-Bodies und Compound Convex |
+| KA Particles | geplant | Splitter, Granulat und grober Staub |
+| KA Volumes | geplant | feiner Staub, Rauch und Feuer |
+| KA Destruction Suite | Abschluss-/Integrationsphase geplant | zentraler Workflow und gemeinsame UI |
+
+### In KA Rigid Dynamics 0.5.1 bereits vorhanden
 
 - Native Jolt-Rigid-Body-Simulation über Culverin 0.13.2.
 - Dynamische Convex-Hull-Collider.
@@ -66,27 +259,28 @@ Transforme + Partikel + Events + OpenVDB/NanoVDB
 - Kontakt-, Payload- und Side-Stick-Diagnosen.
 - Regressionstests für Fall, Stapel, Reibung, CCD, Compound Convex, Cache und Determinismus.
 
-### Noch nicht vorhanden
+### Im Gesamtsystem noch nicht vorhanden
 
-- Vollständiger PhysX-Backendpfad.
-- Native PhysX-GPU-Rigid-Bodies.
-- NVIDIA Blast und Bond-/Support-Graph-Auswertung.
-- Dynamische Triangle-Mesh-zu-Triangle-Mesh-Kollision.
-- PhysX-PBD-Partikelsystem.
-- Eigenes Material- und Schadensmodell.
-- Solverunabhängiger Event Stream.
-- Volumetrischer Staub.
-- NVIDIA Flow.
-- Rauch- und Feuerberechnung.
-- OpenVDB-/NanoVDB-Ausgabe.
+- versionierter KA Simulation Core,
+- vollständiger PhysX-Backendpfad,
+- native PhysX-GPU-Rigid-Bodies,
+- NVIDIA Blast und Bond-/Support-Graph-Auswertung,
+- PhysX-PBD-Partikelsystem,
+- gemeinsames Material- und Schadensmodell,
+- solverunabhängiger Event Stream,
+- volumetrischer Staub,
+- NVIDIA Flow,
+- Rauch- und Feuerberechnung,
+- OpenVDB-/NanoVDB-Ausgabe,
+- koordinierendes KA-Destruction-Suite-Add-on.
 
 ---
 
-## 3. Grundprinzip: Mehrere gekoppelte Skalen statt eines einzigen Solvers
+## 6. Grundprinzip: Mehrere gekoppelte Skalen statt eines einzigen Solvers
 
 Ein einzelner Solver sollte nicht gleichzeitig große Fragmente, feine Körner und luftgetragenen Staub als identische Objekte behandeln. Das wäre entweder zu ungenau oder unnötig teuer.
 
-Das System wird deshalb in vier Größenklassen getrennt:
+Das Gesamtsystem wird deshalb in vier Größenklassen getrennt:
 
 | Größenklasse | Darstellung | Geplanter Solver |
 |---|---|---|
@@ -99,7 +293,7 @@ Die Kopplung erfolgt über Ereignisse, Impulse, Energie und Materialparameter. N
 
 ---
 
-## 4. Geometry Authoring und Fracturing
+## 7. KA Fracture: Geometry Authoring und Fracturing
 
 KA Fracture soll weiterhin die visuelle und geometrische Erzeugung der Bruchstücke übernehmen:
 
@@ -147,9 +341,9 @@ Die Kollisionsgeometrie sollte möglichst vor Rough Surface, hochauflösender Un
 
 ---
 
-## 5. Collision-Proxys
+## 8. Collision-Proxys
 
-### 5.1 Single Convex Hull
+### 8.1 Single Convex Hull
 
 Der schnellste und stabilste Standard. Geeignet für nahezu konvexe Fragmente und Massensimulationen.
 
@@ -160,11 +354,11 @@ Nachteile:
 - kann Kontaktflächen vergrößern,
 - kann das Stapelverhalten verändern.
 
-### 5.2 Compound Convex
+### 8.2 Compound Convex
 
 Mehrere konvexe Teilkörper bilden eine konkave Form näherungsweise nach. Dies ist die bevorzugte präzise Kollisionsform für dynamische Bruchstücke.
 
-Version 0.5.1 verwendet CoACD zur Zerlegung. Aufgrund der aktuellen Culverin-Grenzen wird ein logischer Compound-Körper intern noch als mehrere Jolt-Bodies mit festen Verbindungen dargestellt. Langfristig soll eine native Jolt-`StaticCompoundShape` beziehungsweise ein echter PhysX-Compound-Actor verwendet werden.
+KA Rigid Dynamics 0.5.1 verwendet CoACD zur Zerlegung. Aufgrund der aktuellen Culverin-Grenzen wird ein logischer Compound-Körper intern noch als mehrere Jolt-Bodies mit festen Verbindungen dargestellt. Langfristig soll eine native Jolt-`StaticCompoundShape` beziehungsweise ein echter PhysX-Compound-Actor verwendet werden.
 
 Empfohlene Qualitätsstufen:
 
@@ -175,14 +369,14 @@ Empfohlene Qualitätsstufen:
 | Accurate | 16 | sichtbare Nahaufnahme |
 | Custom | benutzerdefiniert | gezielte Problemlösung |
 
-### 5.3 Triangle Mesh
+### 8.3 Triangle Mesh
 
 - Für statische Umgebung sehr genau und sinnvoll.
 - Für dynamische Körper solverabhängig und problematisch.
 - Dynamisches Mesh-gegen-Mesh ist in Jolt nicht als allgemeiner Produktionsweg geeignet.
 - Ein späterer PhysX-Pfad kann zusätzliche Optionen wie GPU-SDF-Collider bereitstellen.
 
-### 5.4 Geplante automatische Auswahl
+### 8.4 Geplante automatische Auswahl
 
 Ein späterer `Auto`-Modus soll pro Körper entscheiden:
 
@@ -197,7 +391,7 @@ Die automatische Entscheidung soll auf gemessener Formabweichung, Konkavität, O
 
 ---
 
-## 6. Destruction Asset und Bond Graph
+## 9. Destruction Asset und Bond Graph
 
 Die Nachbarschaft zwischen Fragmenten muss direkt beim Fracturing bestimmt werden. Zwei Fragmente gelten als verbunden, wenn sie eine gemeinsame ursprüngliche Bruchfläche besitzen.
 
@@ -243,7 +437,7 @@ NVIDIA Blast ist genau für diese Chunk-, Bond-, Support-Graph- und Actor-Auftei
 
 ---
 
-## 7. Material- und Schadensmodell
+## 10. Gemeinsames Material- und Schadensmodell
 
 Das System benötigt eigene Materialprofile, die unabhängig vom Solver funktionieren.
 
@@ -320,9 +514,9 @@ Für spröde Materialien ist eine Kombination aus Spannungsgrenze und notwendige
 
 ---
 
-## 8. Solverstrategie
+## 11. KA Rigid Dynamics: Solverstrategie
 
-### 8.1 Jolt
+### 11.1 Jolt
 
 Jolt bleibt sinnvoll als:
 
@@ -332,7 +526,7 @@ Jolt bleibt sinnvoll als:
 - Referenzsolver für Regression und Vergleiche,
 - produktiver Rigid-Body-only-Pfad.
 
-### 8.2 PhysX
+### 11.2 PhysX
 
 PhysX ist als zukünftiger Hauptpfad interessant, weil eine gemeinsame Plattform Folgendes verbinden kann:
 
@@ -347,7 +541,7 @@ PhysX ist als zukünftiger Hauptpfad interessant, weil eine gemeinsame Plattform
 
 PhysX ist nicht automatisch in jeder kleinen Szene schneller. Der GPU-Pfad lohnt sich vor allem bei hoher Body-, Kontakt- oder Partikelzahl. Daher müssen CPU und GPU mit identischen Szenen gemessen werden.
 
-### 8.3 Blast
+### 11.3 Blast
 
 Blast soll nicht KA Fracture ersetzen. Geplant ist:
 
@@ -355,7 +549,7 @@ Blast soll nicht KA Fracture ersetzen. Geplant ist:
 - Blast verwaltet Support Graph, Schaden, Bond-Bruch und Actor-Splitting.
 - PhysX simuliert die daraus entstehenden Actors.
 
-### 8.4 Warp und Newton
+### 11.4 Warp und Newton
 
 NVIDIA Warp ist als Werkzeug für eigene GPU-Kernels interessant, etwa für:
 
@@ -370,7 +564,7 @@ Newton ist derzeit eher eine Forschungs- und Robotikplattform mit mehreren Solve
 
 ---
 
-## 9. Solverunabhängiger Event Stream
+## 12. Solverunabhängiger Event Stream
 
 Der wichtigste eigene Systemteil ist eine neutrale Ereignisschicht zwischen Simulation und Sekundäreffekten.
 
@@ -431,9 +625,9 @@ Der Event Stream muss unabhängig davon funktionieren, ob die Daten von Jolt ode
 
 ---
 
-## 10. Sekundäre Splitter und granulare Partikel
+## 13. KA Particles: Sekundäre Splitter und granulare Partikel
 
-### 10.1 Sekundäre Rigid-Body-Splitter
+### 13.1 Sekundäre Rigid-Body-Splitter
 
 Sichtbare größere Splitter sollen als echte kleine Rigid Bodies behandelt werden. Sie können:
 
@@ -442,7 +636,7 @@ Sichtbare größere Splitter sollen als echte kleine Rigid Bodies behandelt werd
 - aus einer hierarchischen Fracture-Stufe erzeugt,
 - abhängig von Energie und Material ausgewählt werden.
 
-### 10.2 Granulare Partikel
+### 13.2 Granulare Partikel
 
 PhysX-PBD-Partikel sind für folgende Stoffe vorgesehen:
 
@@ -455,7 +649,7 @@ PhysX-PBD-Partikel sind für folgende Stoffe vorgesehen:
 
 PBD-Partikel sollen nicht als Ersatz für alle Rigid Bodies dienen. Große sichtbare Splitter benötigen weiterhin Rotation, Form und präzise Kollision.
 
-### 10.3 Größenverteilung
+### 13.3 Größenverteilung
 
 Die Partikelgröße sollte materialabhängig aus einer Verteilung erzeugt werden, nicht als einheitlicher Radius. Relevante Parameter:
 
@@ -470,13 +664,13 @@ Die Partikelgröße sollte materialabhängig aus einer Verteilung erzeugt werden
 
 ---
 
-## 11. Physikalisch begründete Emission
+## 14. Physikalisch begründete Emission
 
 Eine reine Änderung der Geschwindigkeit darf nicht automatisch Staub erzeugen. Ein elastisch springender Metallkörper kann eine hohe Beschleunigung haben, aber kaum Staub freisetzen.
 
 Drei Emissionsmodelle werden getrennt behandelt.
 
-### 11.1 Bruchstaub
+### 14.1 Bruchstaub
 
 Entsteht beim Brechen von Bonds und Freilegen neuer Oberfläche:
 
@@ -497,7 +691,7 @@ Relevante Werte:
 - Rauheit,
 - Hierarchiestufe.
 
-### 11.2 Aufprallstaub
+### 14.2 Aufprallstaub
 
 Die verfügbare Aufprallenergie kann näherungsweise aus effektiver Masse und relativer Normalgeschwindigkeit berechnet werden:
 
@@ -507,7 +701,7 @@ E_impact = 0.5 × m_eff × v_normal²
 
 Nur der dissipierte Anteil oberhalb einer Materialschwelle erzeugt Staub oder Splitter.
 
-### 11.3 Reibungs- und Schleifstaub
+### 14.3 Reibungs- und Schleifstaub
 
 Für längere tangentiale Kontakte:
 
@@ -526,7 +720,7 @@ Zusätzliche Faktoren:
 
 Dadurch kann ein Betonfragment beim Aufschlag eine kurze Wolke und beim anschließenden Rutschen eine schwächere Staubspur erzeugen.
 
-### 11.4 Budgetierung
+### 14.4 Budgetierung
 
 Die physikalisch berechnete Masse wird nicht zwingend als identische Zahl realer Simulationspartikel dargestellt. Stattdessen wird zwischen physikalischer Masse und Darstellung getrennt:
 
@@ -540,7 +734,7 @@ repräsentative Partikel + Volumendichte
 
 ---
 
-## 12. Feiner Staub als Volumen
+## 15. KA Volumes: Feiner Staub als Volumen
 
 Feiner luftgetragener Staub verhält sich eher wie Rauch als wie eine Menge klar getrennter Kugeln. Er benötigt:
 
@@ -567,9 +761,9 @@ Die Partikel können grobe ballistische Bewegung abbilden. Das Volumen erzeugt d
 
 ---
 
-## 13. Rauch und Feuer
+## 16. Rauch und Feuer
 
-### 13.1 NVIDIA Flow
+### 16.1 NVIDIA Flow
 
 NVIDIA Flow ist als geplanter Sparse-Voxel-Solver für folgende Effekte vorgesehen:
 
@@ -581,7 +775,7 @@ NVIDIA Flow ist als geplanter Sparse-Voxel-Solver für folgende Effekte vorgeseh
 
 Sparse bedeutet, dass nur aktive Bereiche des Volumens Speicher und Rechenzeit benötigen.
 
-### 13.2 Gemeinsame Volumenkanäle
+### 16.2 Gemeinsame Volumenkanäle
 
 ```text
 Staub
@@ -602,7 +796,7 @@ Feuer
 - velocity
 ```
 
-### 13.3 Feuer als spätere Stufe
+### 16.3 Feuer als spätere Stufe
 
 Feuer benötigt zusätzlich:
 
@@ -619,7 +813,7 @@ Die Architektur soll Feuer von Beginn an berücksichtigen, die Implementierung b
 
 ---
 
-## 14. Cache-Architektur
+## 17. Gemeinsame Cache-Architektur
 
 Jede Simulationsdomäne benötigt einen eigenen versionierten Cache.
 
@@ -657,133 +851,204 @@ Ein geänderter Shader soll keinen Rigid-Body-Rebake auslösen. Eine geänderte 
 
 ---
 
-## 15. Geplante Modulstruktur
+## 18. Geplante Paket- und Repository-Struktur
+
+Die Funktionsbereiche bleiben in getrennten Add-ons beziehungsweise Repositories:
 
 ```text
-ka_rigid_dynamics/
-├─ geometry/
-│  ├─ fracture_asset.py
-│  ├─ adjacency.py
-│  ├─ collision_proxy.py
-│  └─ mass_properties.py
-├─ destruction/
-│  ├─ fragment_graph.py
-│  ├─ bond_graph.py
-│  ├─ materials.py
-│  ├─ damage.py
-│  └─ island_split.py
-├─ simulation/
-│  ├─ scene_description.py
-│  ├─ events.py
-│  ├─ jolt_backend.py
-│  ├─ physx_backend.py
-│  └─ blast_bridge.py
-├─ particles/
-│  ├─ emission.py
-│  ├─ rigid_debris.py
-│  ├─ pbd_backend.py
-│  └─ particle_cache.py
-├─ volumes/
-│  ├─ dust.py
-│  ├─ flow_bridge.py
-│  ├─ vdb_cache.py
-│  └─ combustion.py
-├─ cache/
-│  ├─ manifest.py
-│  ├─ rigid_cache.py
-│  ├─ event_cache.py
-│  └─ invalidation.py
+ka_simulation_core/
+├─ ids.py
+├─ units.py
+├─ schemas/
+│  ├─ destruction_asset.py
+│  ├─ simulation_scene.py
+│  ├─ material_profile.py
+│  └─ simulation_event.py
+├─ cache_manifest.py
+├─ compatibility.py
+└─ registry.py
+
+ka_fracture/
+├─ fracture/
+├─ surfaces/
+├─ adjacency/
+├─ collision_proxy/
+├─ asset_export/
 └─ blender/
-   ├─ properties.py
-   ├─ operators.py
-   ├─ ui.py
-   └─ playback.py
+
+ka_rigid_dynamics/
+├─ scene_adapter/
+├─ collision/
+├─ destruction/
+├─ backends/
+│  ├─ jolt/
+│  ├─ physx/
+│  └─ blast/
+├─ events/
+├─ cache/
+└─ blender/
+
+ka_particles/
+├─ emission/
+├─ rigid_debris/
+├─ granular/
+├─ backends/
+├─ cache/
+└─ blender/
+
+ka_volumes/
+├─ dust/
+├─ smoke/
+├─ combustion/
+├─ flow_bridge/
+├─ vdb_cache/
+└─ blender/
+
+ka_destruction_suite/
+├─ module_registry/
+├─ workflow/
+├─ dependency_graph/
+├─ presets/
+├─ diagnostics/
+└─ blender/
 ```
 
-Die tatsächliche Umstrukturierung soll schrittweise erfolgen, damit der vorhandene Jolt-Pfad nach jedem Schritt funktionsfähig bleibt.
+### Auslieferungsformen
+
+Es sollen zwei Formen möglich sein:
+
+1. **Einzelmodule:** jedes Add-on separat installierbar und nutzbar.
+2. **KA Destruction Suite:** gemeinsame Auslieferung beziehungsweise Koordination aller kompatiblen Module.
+
+Auch bei einer gemeinsamen Suite-Auslieferung bleiben interne Python-Pakete, native Bibliotheken, Cache-Schemata und Tests modular getrennt. Das verhindert, dass eine Änderung am Volume-Solver den Rigid-Body-Kern oder das Fracture-Add-on unnötig destabilisiert.
 
 ---
 
-## 16. Entwicklungsphasen
+## 19. Versions- und Kompatibilitätsmodell
 
-### Phase 1 – Solverunabhängiges Fundament
+Jedes Modul wird unabhängig versioniert. Beispiel:
 
-- `SimulationScene` und neutrale Body-/Shape-Datentypen definieren.
-- stabile Fragment-, Bond-, Material- und Event-IDs einführen.
-- Fragment Graph und Bond Graph implementieren.
-- gemeinsame Bruchflächen aus KA Fracture übernehmen.
-- Materialprofile und Schadensparameter definieren.
-- Event-Schema und Cache-Manifest festlegen.
-- vorhandenen Jolt-Pfad auf die neutrale Szene umstellen.
+```text
+KA Simulation Core       1.0.0
+KA Fracture              1.3.0
+KA Rigid Dynamics        0.8.0
+KA Particles             0.4.0
+KA Volumes               0.2.0
+KA Destruction Suite     0.1.0
+```
 
-**Abnahmekriterium:** Der bestehende Jolt-Bake liefert vor und nach der Umstellung identische beziehungsweise toleranzgleichwertige Ergebnisse.
+Die Suite und jedes datenlesende Modul prüfen nicht nur Add-on-Versionen, sondern auch Schema-Versionen:
 
-### Phase 2 – PhysX-Rigid-Body-Prototyp
+```text
+DestructionAsset schema  1
+SimulationScene schema   1
+SimulationEvent schema   1
+MaterialProfile schema   1
+CacheManifest schema     1
+```
 
-- kontrollierte native C++-Bridge für Windows und Linux.
-- CPU- und optionaler CUDA-GPU-Modus.
-- statische Triangle Meshes.
-- dynamische Convex Hulls.
-- native Compound Convex Actors.
-- Masse, Trägheit, Reibung, Restitution und Dämpfung.
-- Transform- und Kontaktdaten.
-- identischer Cachevertrag wie Jolt.
+Ein Modul darf neuere unbekannte Pflichtfelder nicht stillschweigend ignorieren. Für ältere Daten werden kontrollierte Migrationen oder klare Fehlermeldungen benötigt.
 
-**Abnahmekriterium:** Gleiche Testszene kann ohne Blender-Datenumbau mit Jolt oder PhysX gebacken werden.
+Beispiel einer Suite-Anforderung:
 
-### Phase 3 – Blast und Zusammenhalt
+```text
+KA Simulation Core >= 1.0
+KA Fracture >= 1.3
+KA Rigid Dynamics >= 0.8
+KA Particles >= 0.4       optional
+KA Volumes >= 0.2         optional
+```
 
-- Blast-Asset aus Fragmenten und Bonds erzeugen.
-- Support Graph definieren.
-- Schadensakkumulation.
-- Stress-Solver evaluieren.
-- Actor-Splitting bei Graphtrennung.
-- korrekte Masse, Trägheit und Geschwindigkeit neuer Inseln.
+Fehlende optionale Module deaktivieren nur die zugehörige Workflow-Stufe. Das gesamte System darf dadurch nicht unbrauchbar werden.
 
-**Abnahmekriterium:** Ein zunächst zusammenhängender Körper zerfällt nur dort, wo Material- und Belastungsparameter dies auslösen.
+---
+
+## 20. Entwicklungsphasen
+
+### Phase 0 – Gemeinsamen Vertrag definieren
+
+- KA Simulation Core als kleines eigenständiges Paket anlegen.
+- SI-Einheiten, Achsen, Skalierung und ID-Regeln festlegen.
+- `DestructionAsset`, `SimulationScene`, `MaterialProfile`, `SimulationEvent` und `CacheManifest` versionieren.
+- Modulregistrierung und Capability-Abfrage definieren.
+- diese gemeinsame README als Master-Dokument etablieren.
+
+**Abnahmekriterium:** Zwei unabhängige Testmodule können ein Asset beziehungsweise Event ohne direkte gegenseitige Imports schreiben und lesen.
+
+### Phase 1 – KA Fracture als Datenproduzent
+
+- stabile Fragment-IDs,
+- gemeinsame Bruchflächen und Nachbarschaften,
+- glatte Ausgangsmeshes und Collision-Proxys,
+- Fragment- und Bond-Graph,
+- exportierbares Destruction Asset,
+- Validierung und Vorschau.
+
+**Abnahmekriterium:** Ein Fracture-Ergebnis kann gespeichert, neu geladen und von einem neutralen Testleser eindeutig rekonstruiert werden.
+
+### Phase 2 – KA Rigid Dynamics auf neutralen Core umstellen
+
+- vorhandenen Jolt-Pfad auf `SimulationScene` umstellen,
+- Cache und Events an stabile IDs binden,
+- bestehende Ergebnisse vor und nach der Umstellung vergleichen,
+- Compound Convex weiter stabilisieren,
+- anschließend PhysX-Rigid-Body-Prototyp entwickeln.
+
+**Abnahmekriterium:** Die gleiche Testszene kann ohne Änderung des Blender-Assets mit Jolt und später PhysX gebacken werden.
+
+### Phase 3 – Zusammenhalt und dynamische Zerstörung
+
+- Bonds und Support Graph,
+- Material- und Schadensparameter,
+- Blast evaluieren und integrieren,
+- Schadensakkumulation,
+- Inseltrennung,
+- korrekte Masse, Trägheit und Geschwindigkeit neuer Actors.
+
+**Abnahmekriterium:** Ein Körper zerfällt nur an physikalisch beziehungsweise parametrisch ausgelösten Verbindungen.
 
 ### Phase 4 – Event Stream
 
-- Kontakt-, Impact-, Slide- und Separation-Events.
-- Bond-Damage- und Bond-Break-Events.
-- Energie- und Flächenberechnung.
-- native Ringbuffer.
-- Filterung und zeitliche Zusammenfassung.
-- Event-Cache und Diagnoseansicht.
+- Kontakt-, Impact-, Slide-, Scrape- und Separation-Events,
+- Bond-Damage- und Bond-Break-Events,
+- Energie- und Flächenberechnung,
+- native Ringbuffer,
+- Filterung, Aggregation und Event-Cache.
 
-**Abnahmekriterium:** Identische Ereignisdaten können unabhängig vom späteren Partikel- oder Volume-Solver ausgewertet werden.
+**Abnahmekriterium:** Events können von einem unabhängigen Test-Consumer verarbeitet werden, ohne den Solver zu kennen.
 
-### Phase 5 – Sekundäre Splitter und PBD-Partikel
+### Phase 5 – KA Particles
 
-- hierarchische kleine Rigid-Body-Splitter.
-- PhysX-PBD-Partikelsystem.
-- materialabhängige Größenverteilungen.
-- kontakt- und bruchabhängige Emission.
-- Sleeping, Lebensdauer und LOD.
-- Partikelcache.
+- manuelle und eventbasierte Emitter,
+- hierarchische Rigid-Body-Splitter,
+- PhysX-PBD oder alternativer granularer Solver,
+- materialabhängige Größenverteilungen,
+- Sleeping, Lebensdauer, LOD und Partikelcache.
 
-### Phase 6 – Volumetrischer Staub
+### Phase 6 – KA Volumes
 
-- Staubemission aus Event Stream.
-- Übergabe von Dichte, Impuls und Temperatur an Sparse Volume.
-- Luftwiderstand und Sinkgeschwindigkeit.
-- Rigid-Body-Kollision beziehungsweise Hindernisfelder.
-- OpenVDB-/NanoVDB-Ausgabe.
+- Staubemission aus Event Stream,
+- Dichte-, Impuls- und Temperaturübergabe,
+- Sparse-Volume-Solver,
+- Hindernisfelder aus Rigid Bodies,
+- OpenVDB-/NanoVDB-Ausgabe,
+- danach Rauch und Feuer.
 
-### Phase 7 – Rauch und Feuer
+### Phase 7 – KA Destruction Suite
 
-- Rauchquellen.
-- Temperatur- und Brennstoffkanäle.
-- vereinfachte Verbrennung.
-- Wärmeübertragung.
-- Materialabhängige Rauch- und Rußausbeute.
-- Rendering-Presets in Blender.
+- Modul- und Versionsprüfung,
+- gemeinsame UI,
+- Bake-Abhängigkeitsgraph,
+- Presets und Materialbibliothek,
+- einheitliches Cache-Management,
+- Fortschritt, Fehlerprüfung und Diagnose,
+- gemeinsame Auslieferung ohne Verlust der Modulgrenzen.
 
 ---
 
-## 17. Test- und Benchmarkplan
+## 21. Test- und Benchmarkplan
 
-### 17.1 Rigid Bodies
+### 21.1 Rigid Bodies
 
 - 100, 500, 1.000 und 5.000 Bodies.
 - Cold und Warm Collider Cache.
@@ -793,7 +1058,7 @@ Die tatsächliche Umstrukturierung soll schrittweise erfolgen, damit der vorhand
 - Stapel, Schüttung, Fall, Kollision, dünne Hindernisse und CCD.
 - Sleeping und frühes Bake-Ende.
 
-### 17.2 Bonds und Zerstörung
+### 21.2 Bonds und Zerstörung
 
 - einzelner Zug-, Druck-, Scher- und Torsionstest.
 - wiederholte Belastung und Schadensakkumulation.
@@ -802,7 +1067,7 @@ Die tatsächliche Umstrukturierung soll schrittweise erfolgen, damit der vorhand
 - Impuls- und Energieerhaltung beim Splitting.
 - Beton-, Glas-, Holz- und Metallprofile.
 
-### 17.3 Partikel
+### 21.3 Partikel
 
 - Emissionsmasse gegen berechnete Bruch-/Dissipationsenergie.
 - Korngrößenverteilung.
@@ -810,7 +1075,7 @@ Die tatsächliche Umstrukturierung soll schrittweise erfolgen, damit der vorhand
 - Sleeping und Partikelverdichtung.
 - 10.000, 100.000 und 1.000.000 repräsentative Partikel, soweit Backend und GPU dies erlauben.
 
-### 17.4 Staub und Volumen
+### 21.4 Staub und Volumen
 
 - Dichteerhaltung.
 - Impulsübertragung.
@@ -820,7 +1085,7 @@ Die tatsächliche Umstrukturierung soll schrittweise erfolgen, damit der vorhand
 - VDB-Dateigröße und Schreibzeit.
 - visuelle Übereinstimmung bei identischen Events.
 
-### 17.5 Reproduzierbarkeit
+### 21.5 Reproduzierbarkeit
 
 - identischer Doppel-Bake.
 - Neustart mit Warm Cache.
@@ -830,35 +1095,47 @@ Die tatsächliche Umstrukturierung soll schrittweise erfolgen, damit der vorhand
 
 ---
 
-## 18. UI-Grundsätze
+## 22. UI-Grundsätze
 
-Die normale Oberfläche soll wenige produktionsrelevante Entscheidungen zeigen:
+### Einzel-Add-ons
 
-- Solver: Auto / Jolt / PhysX.
-- Qualitätsprofil: Fast / Balanced / Accurate.
-- Materialprofil.
-- Collider: Auto / Convex / Compound / Static Mesh.
-- Zusammenhalt: None / Bonded / Hierarchical.
-- Partikel und Staub: Off / Material Driven / Custom.
-- Bake, Cache und Playback.
+Jedes Einzel-Add-on zeigt nur seine eigenen produktionsrelevanten Funktionen und bleibt ohne Suite bedienbar.
 
-Technische Einzelparameter gehören in aufklappbare Bereiche:
+**KA Fracture** zeigt Fragmentierung, Oberflächen, Proxy-Erzeugung und Asset-Export.  
+**KA Rigid Dynamics** zeigt Solver, Collider, Bodies, Zusammenhalt, Bake und Rigid-Cache.  
+**KA Particles** zeigt Emitter, Partikelmaterial, Solver, LOD und Partikelcache.  
+**KA Volumes** zeigt Quellen, Volumenkanäle, Qualität, Domain und VDB-Cache.
 
-- Advanced Rigid Body,
-- Advanced Fracture,
-- Advanced Bonds,
-- Advanced Particles,
-- Advanced Volumes,
-- Diagnostics & Developer.
+### KA Destruction Suite
 
-Nicht implementierte Solver dürfen nicht als scheinbar funktionierende Produktionsoption sichtbar sein.
+Die Suite zeigt eine reduzierte, durchgängige Prozessoberfläche:
+
+- Fracture,
+- Destruction Asset,
+- Rigid Dynamics,
+- Particles,
+- Volumes,
+- Gesamt-Bake,
+- Cache und Playback,
+- Diagnose.
+
+Die Suite darf Einstellungen nicht duplizieren. Sie ruft die öffentlichen Operatoren und Datenverträge der Einzelmodule auf.
+
+### Allgemeine UI-Regeln
+
+- wenige Presets in der normalen Oberfläche,
+- technische Einzelwerte in aufklappbaren Advanced-Bereichen,
+- nicht installierte oder nicht implementierte Fähigkeiten klar kennzeichnen,
+- keine scheinbar funktionsfähigen Backend-Optionen ohne vollständigen Pfad,
+- Abhängigkeiten und nötige Rebakes sichtbar machen,
+- Modulgrenzen für Benutzer möglichst verständlich, aber nicht störend darstellen.
 
 ---
 
-## 19. Entwicklungsregeln
+## 23. Entwicklungsregeln
 
 1. Render-Geometrie und Collision-Geometrie bleiben getrennt.
-2. Alle externen Solver erhalten dieselbe neutrale Szenenbeschreibung.
+2. Alle Rigid-Body-Backends erhalten dieselbe neutrale Szenenbeschreibung.
 3. Solverabhängige Daten dürfen nicht unkontrolliert in UI oder Cacheformat durchsickern.
 4. Material- und Emissionsmodelle bleiben solverunabhängig.
 5. Neue Effekte werden aus dem Event Stream gespeist, nicht aus direkter UI-Verkabelung.
@@ -869,10 +1146,15 @@ Nicht implementierte Solver dürfen nicht als scheinbar funktionierende Produkti
 10. Neue Backends werden zuerst mit kleinen isolierten Tests und danach mit realen Fracture-Szenen geprüft.
 11. GPU-Unterstützung wird gemessen, nicht pauschal als schneller angenommen.
 12. Forschungskomponenten werden erst nach belastbarer Validierung zu Produktionsabhängigkeiten.
+13. Einzelmodule bleiben unabhängig installierbar und testbar.
+14. Funktionsmodule kommunizieren über Core-Verträge statt über private Klassen.
+15. Das Suite-Add-on koordiniert, dupliziert aber keine Simulationslogik.
+16. Die gemeinsame README wird synchron gehalten; modulbezogene Details bleiben in modulspezifischen Dateien.
+17. Ein Modulfehler darf nach Möglichkeit nicht die Registrierung aller anderen Module verhindern.
 
 ---
 
-## 20. Risiken und offene Entscheidungen
+## 24. Risiken und offene Entscheidungen
 
 ### Native Bibliotheken
 
@@ -910,9 +1192,21 @@ Alle internen Daten müssen eindeutig in SI-Einheiten definiert werden:
 
 Blender-Skalierung und Objekttransformationen werden vor Solverübergabe normalisiert.
 
+### Versionsdrift zwischen Add-ons
+
+Getrennte Entwicklung kann zu inkompatiblen Datenständen führen. Deshalb sind Schema-Versionen, Capability-Abfragen, Mindestversionen und Migrationstests zwingend.
+
+### Doppelte Benutzeroberflächen
+
+Einzelmodule und Suite dürfen dieselben Parameter nicht in voneinander unabhängigen Property-Sätzen speichern. Die Suite soll vorhandene Modul-Properties bedienen oder auf gemeinsame Core-Properties verweisen.
+
+### Gemeinsame README
+
+Eine identische Master-README kann veralten, wenn sie nicht in alle Repositories übernommen wird. Der Dokumentationsstand sollte deshalb bei Releases geprüft und idealerweise durch ein Synchronisationsskript aktualisiert werden.
+
 ---
 
-## 21. Externe Grundlagen und Referenzen
+## 25. Externe Grundlagen und Referenzen
 
 Die folgenden Projekte und Dokumentationen bilden die derzeit geplante technische Grundlage. Sie sind keine Garantie, dass jede Komponente unverändert integriert wird.
 
@@ -940,31 +1234,55 @@ Die folgenden Projekte und Dokumentationen bilden die derzeit geplante technisch
 
 ---
 
-## 22. Unmittelbar nächster Entwicklungsschritt
+## 26. Unmittelbar nächste Entwicklungsschritte
 
-Vor einer Partikel-, Rauch- oder Feuerimplementierung wird das solverunabhängige Fundament aufgebaut:
+Die nächste Arbeit soll die Modultrennung technisch absichern, bevor weitere große Solver integriert werden:
 
-1. `SimulationScene` als neutrale Szenenbeschreibung.
-2. stabile Fragment-, Bond-, Material- und Event-IDs.
-3. Fragment Graph und Bond Graph.
-4. gemeinsame Bruchflächen aus KA Fracture.
-5. Materialprofile und Schadensparameter.
-6. Event-Schema und versionierter Event-Cache.
-7. Umstellung des bestehenden Jolt-Pfads auf diese Datenstruktur.
-8. Danach ein kleiner PhysX-Rigid-Body-Prototyp.
+1. Gemeinsame Schemata für `DestructionAsset`, `SimulationScene`, `MaterialProfile`, `SimulationEvent` und `CacheManifest` entwerfen.
+2. Entscheiden, ob KA Simulation Core als eigenes Blender-Add-on, eingebettetes versioniertes Python-Paket oder beides ausgeliefert wird.
+3. Stabile IDs und SI-Einheiten in KA Fracture und KA Rigid Dynamics vereinheitlichen.
+4. KA Fracture um Fragment-Graph, gemeinsame Bruchflächen und Asset-Export ergänzen.
+5. KA Rigid Dynamics so umbauen, dass es dieses neutrale Asset lesen kann, ohne KA Fracture importieren zu müssen.
+6. Den vorhandenen Jolt-Pfad auf die neutrale `SimulationScene` umstellen und Regressionen vergleichen.
+7. Erst danach den PhysX-/Blast-Prototyp beginnen.
+8. KA Particles und KA Volumes zunächst mit aufgezeichneten Test-Events entwickeln, damit sie nicht von einem unfertigen PhysX-Pfad blockiert werden.
+9. KA Destruction Suite erst aufbauen, sobald mindestens Fracture und Rigid Dynamics stabile öffentliche Schnittstellen besitzen.
 
-Diese Reihenfolge verhindert, dass Collider, Materialien, Cache, UI und Ereignislogik für PhysX, Partikel und Flow mehrfach neu gebaut werden müssen.
+Diese Reihenfolge ermöglicht parallele und unabhängige Entwicklung, ohne die spätere Integration dem Zufall zu überlassen.
 
 ---
 
-## 23. Installation der aktuellen Version
+## 27. Verwendung dieser README in den Einzel-Add-ons
 
-1. Das Add-on-ZIP in Blender über `Edit > Preferences > Get Extensions > Install from Disk` installieren.
-2. Blender nach einem fehlgeschlagenen Registrierungsversuch vollständig neu starten.
+Diese Datei wird unverändert oder automatisiert synchronisiert in folgende Pakete aufgenommen:
+
+```text
+KA-Simulation-Core/README.md
+KA-Fracture/README.md
+KA-Rigid-Dynamics/README.md
+KA-Particles/README.md
+KA-Volumes/README.md
+KA-Destruction-Suite/README.md
+```
+
+Jedes Add-on ergänzt zusätzlich:
+
+- `ARCHITECTURE.md` – aktueller interner Aufbau des jeweiligen Moduls,
+- `CHANGELOG.md` – konkrete Versionsänderungen,
+- optional `USER_GUIDE.md` – Bedienung des jeweiligen Add-ons,
+- optional `DEVELOPMENT.md` – Build-, Test- und Abhängigkeitsanweisungen.
+
+Beim Kopieren dieser README darf nicht der Eindruck entstehen, alle beschriebenen Funktionen seien bereits im jeweiligen Modul vorhanden. Maßgeblich ist immer die Statusübersicht sowie die modulspezifische Dokumentation.
+
+### Aktuelles Paket: KA Rigid Dynamics 0.5.1
+
+Für die derzeitige Rigid-Dynamics-Version gilt weiterhin:
+
+1. Add-on-ZIP in Blender über `Edit > Preferences > Get Extensions > Install from Disk` installieren.
+2. Nach einem fehlgeschlagenen Registrierungsversuch Blender vollständig neu starten.
 3. Frühere Versionen mit derselben Add-on-ID vorher entfernen, falls Blender die Installation nicht ersetzt.
 4. Nach Änderungen an Collider-Schema oder nativen Bibliotheken Collider- und Simulationscache löschen.
 5. Für normale Bakes Detaildiagnosen deaktiviert lassen.
 
-Aktuelle Produktionsbasis: **Jolt + CoACD + binärer Cache**.
-
-Geplante Zielbasis: **KA Fracture + solverunabhängiger Destruction Core + PhysX/Blast + Jolt-Fallback + PBD-Partikel + Flow/OpenVDB**.
+Aktuelle Rigid-Body-Basis: **Jolt + CoACD + binärer Cache**.  
+Geplante Gesamtbasis: **modulare KA-Add-ons + gemeinsamer Core + PhysX/Blast + Jolt-Fallback + PBD-Partikel + Flow/OpenVDB**.
