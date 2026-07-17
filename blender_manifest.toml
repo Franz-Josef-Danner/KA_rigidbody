@@ -1,0 +1,9 @@
+schema_version = "1.0.0"
+id = "ka_rigid_dynamics"
+version = "0.5.1"
+name = "KA Rigid Dynamics"
+tagline = "Native Jolt rigid-body simulation and cache for Blender"
+maintainer = "KA"
+type = "add-on"
+blender_version_min = "4.2.0"
+license = ["SPDX:GPL-3.0-or-later"]
