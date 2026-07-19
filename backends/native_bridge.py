@@ -1,12 +1,11 @@
-"""ctypes loader for future native Jolt/PhysX bridge libraries."""
+"""Shared ctypes loader for native KA physics bridge libraries."""
 
 from __future__ import annotations
 
 import ctypes
 import os
-from typing import Optional
 
-EXPECTED_ABI_VERSION = 1
+EXPECTED_ABI_VERSION = 2
 
 
 class NativeBridgeLoadError(RuntimeError):
@@ -37,7 +36,19 @@ def bridge_status(path: str) -> tuple[bool, str]:
     if not path:
         return False, "No native bridge path configured."
     try:
-        load_bridge(path)
+        library = load_bridge(path)
+        if hasattr(library, "ka_physics_backend_name"):
+            library.ka_physics_backend_name.restype = ctypes.c_char_p
+            raw_name = library.ka_physics_backend_name()
+            name = raw_name.decode("utf-8", "replace") if raw_name else "Native bridge"
+        else:
+            name = "Native bridge"
+        if hasattr(library, "ka_physics_backend_version"):
+            library.ka_physics_backend_version.restype = ctypes.c_char_p
+            raw_version = library.ka_physics_backend_version()
+            version = raw_version.decode("utf-8", "replace") if raw_version else "unknown"
+        else:
+            version = "unknown"
     except NativeBridgeLoadError as exc:
         return False, str(exc)
-    return True, "Native bridge loaded and ABI validated."
+    return True, f"{name} {version} loaded; ABI {EXPECTED_ABI_VERSION} validated."

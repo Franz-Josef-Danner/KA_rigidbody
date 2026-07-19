@@ -28,8 +28,18 @@ except Exception:  # Blender builds normally bundle NumPy; keep a pure-Python fa
     _np = None
 
 from .cache import CACHE_VERSION, cache_file_path
+from .bonds import bonds_for_enabled_bodies
 from ..backends.culverin_loader import BUNDLED_CULVERIN_VERSION
-from .coacd_bridge import COACD_VERSION, CoACDError, decompose as coacd_decompose
+from .coacd_bridge import COACD_EXECUTION_MODE, COACD_VERSION, CoACDError, decompose as coacd_decompose
+from .simulation_scene import (
+    BODY_ID_PROPERTY,
+    SCENE_ID_PROPERTY,
+    SIMULATION_SCENE_VERSION,
+    build_simulation_scene,
+    canonical_scene_digest,
+    ensure_scene_body_ids,
+    ensure_stable_id,
+)
 
 
 
@@ -39,10 +49,10 @@ _GEOMETRY_CACHE_TOTAL_HITS = 0
 _GEOMETRY_CACHE_TOTAL_MISSES = 0
 _HULL_CACHE_TOTAL_HITS = 0
 _HULL_CACHE_TOTAL_MISSES = 0
-ADDON_VERSION = "0.5.1"
-SIGNATURE_SCHEMA = 12
+ADDON_VERSION = "0.7.6"
+SIGNATURE_SCHEMA = 24
 _SUPPORT_DIRECTION_CACHE: Dict[int, List[Vector]] = {}
-_PERSISTENT_HULL_CACHE_VERSION = 4
+_PERSISTENT_HULL_CACHE_VERSION = 7
 _PERSISTENT_HULL_CACHE_MAX_ENTRIES = 2048
 _PERSISTENT_HULL_CACHE: "OrderedDict[str, Dict]" = OrderedDict()
 _PERSISTENT_HULL_CACHE_PATH: Optional[str] = None
@@ -50,12 +60,17 @@ _PERSISTENT_HULL_CACHE_DIRTY = False
 _PERSISTENT_HULL_CACHE_LOAD_SECONDS = 0.0
 _PERSISTENT_HULL_CACHE_SAVE_SECONDS = 0.0
 _PERSISTENT_HULL_CACHE_FILE_SIZE = 0
-_HULL_CACHE_MAGIC = b"KACL050\0"
+_HULL_CACHE_MAGIC = b"KACL064\0"
 _HULL_CACHE_HEADER = struct.Struct("<8sIII")
 
 
+def _vector_list(value: Iterable[float]) -> List[float]:
+    """Return a JSON-safe float list for mathutils vectors and numeric sequences."""
+    return [float(component) for component in value]
+
+
 def _persistent_hull_cache_file(directory: str) -> str:
-    return os.path.join(directory, "ka_rigid_colliders_v4.kahc")
+    return os.path.join(directory, "ka_rigid_colliders_v7.kahc")
 
 
 def _legacy_persistent_hull_cache_file(directory: str) -> str:
@@ -113,6 +128,9 @@ def _encode_persistent_hulls() -> Tuple[bytes, bytes]:
                         "raw_vertex_count": int(part.get("raw_vertex_count", len(part_points))),
                         "selected_vertex_count": int(part.get("selected_vertex_count", len(part_points))),
                         "hull_quality": dict(part.get("hull_quality", {})),
+                        "box_center": [float(value) for value in part.get("box_center", part.get("center", (0.0, 0.0, 0.0)))[:3]],
+                        "box_half_extents": [float(value) for value in part.get("box_half_extents", (0.0, 0.0, 0.0))[:3]],
+                        "box_rotation": [float(value) for value in part.get("box_rotation", (1.0, 0.0, 0.0, 0.0))[:4]],
                     })
                 if parts:
                     compound_records.append({
@@ -180,6 +198,9 @@ def _decode_persistent_hulls(metadata_blob: bytes, values_blob: bytes) -> "Order
                     "raw_vertex_count": int(part_record.get("raw_vertex_count", point_count)),
                     "selected_vertex_count": int(part_record.get("selected_vertex_count", point_count)),
                     "hull_quality": dict(part_record.get("hull_quality", {})),
+                    "box_center": [float(value) for value in part_record.get("box_center", part_record.get("center", (0.0, 0.0, 0.0)))[:3]],
+                    "box_half_extents": [float(value) for value in part_record.get("box_half_extents", (0.0, 0.0, 0.0))[:3]],
+                    "box_rotation": [float(value) for value in part_record.get("box_rotation", (1.0, 0.0, 0.0, 0.0))[:4]],
                 })
             if parts:
                 compounds[str(record.get("key", ""))] = {
@@ -359,7 +380,7 @@ def geometry_cache_stats() -> Dict[str, object]:
         "persistent_hull_load_seconds": float(_PERSISTENT_HULL_CACHE_LOAD_SECONDS),
         "persistent_hull_save_seconds": float(_PERSISTENT_HULL_CACHE_SAVE_SECONDS),
         "persistent_hull_file_size": int(_PERSISTENT_HULL_CACHE_FILE_SIZE),
-        "persistent_hull_format": "KACL4-float64-zlib1",
+        "persistent_hull_format": "KACL7-float64-zlib1",
     }
 
 
@@ -381,6 +402,15 @@ FRACTURE_TAGS = (
     "ka_fracture_break_piece",
     "ka_fracture_prepared_piece",
 )
+
+
+def is_ka_fracture_piece(obj: bpy.types.Object) -> bool:
+    """Return whether an object is a KA Fracture fragment."""
+    return bool(
+        obj.name.startswith("KA_Fracture_Piece_")
+        or any(bool(obj.get(tag, False)) for tag in FRACTURE_TAGS)
+    )
+
 
 GROUND_OBJECT_NAME = "KA_Physics_Ground"
 GROUND_OBJECT_TAG = "ka_rigid_ground"
@@ -1152,10 +1182,19 @@ def _directional_hull_error(complete: Sequence[Vector], simplified: Sequence[Vec
     return maximum, rms
 
 
-def _hull_quality_settings(world) -> Dict[str, object]:
+def _hull_quality_settings(world, *, fracture_piece: bool = False) -> Dict[str, object]:
     preset = str(getattr(world, "hull_quality_preset", "BALANCED")) if world else "BALANCED"
     adaptive = bool(getattr(world, "adaptive_hull_accuracy", True)) if world else True
-    common = {"adaptive": adaptive, "algorithm": "SUPPORT_ERROR_V2"}
+    separation_inset = (
+        max(0.0, float(getattr(world, "fracture_hull_inset", 0.001)))
+        if fracture_piece else 0.0
+    )
+    common = {
+        "adaptive": adaptive,
+        "algorithm": "SUPPORT_ERROR_V3_FRACTURE_INSET",
+        "separation_inset": separation_inset,
+        "fracture_piece": bool(fracture_piece),
+    }
     if preset == "FAST":
         return {**common, "preset": preset, "minimum": 24, "maximum": 40, "rescue_maximum": 96, "absolute_tolerance": 0.0015, "relative_tolerance": 0.012, "precision_rescue": True}
     if preset == "ACCURATE":
@@ -1264,6 +1303,29 @@ def _adaptive_convex_hull_data(
     }
 
 
+def _inset_hull_points(
+    points: Sequence[Vector],
+    center: Vector,
+    requested_inset: float,
+) -> Tuple[List[Vector], float]:
+    """Shrink a hull around its physical center to separate touching fragments."""
+    amount = max(0.0, float(requested_inset))
+    if amount <= 0.0 or not points:
+        return [point.copy() for point in points], 0.0
+    result: List[Vector] = []
+    maximum_applied = 0.0
+    for point in points:
+        delta = point - center
+        length = delta.length
+        if length <= 1.0e-12:
+            result.append(point.copy())
+            continue
+        applied = min(amount, length * 0.12)
+        maximum_applied = max(maximum_applied, applied)
+        result.append(center + delta * ((length - applied) / length))
+    return result, maximum_applied
+
+
 def _cached_convex_hull_data(
     geometry: Dict,
     quality: Dict[str, object],
@@ -1311,8 +1373,13 @@ def _cached_convex_hull_data(
             "characteristic_length": characteristic_length, "precision_rescue": False,
             "rescue_mode": "disabled",
         }
+    requested_inset = max(0.0, float(quality.get("separation_inset", 0.0)))
+    points, applied_inset = _inset_hull_points(points, center, requested_inset)
+    metrics["separation_inset_requested"] = requested_inset
+    metrics["separation_inset_applied"] = float(applied_inset)
+    metrics["fracture_piece"] = bool(quality.get("fracture_piece", False))
     metrics["preset"] = quality.get("preset", "CUSTOM")
-    metrics["algorithm"] = quality.get("algorithm", "SUPPORT_ERROR_V2")
+    metrics["algorithm"] = quality.get("algorithm", "SUPPORT_ERROR_V3_FRACTURE_INSET")
     metrics["absolute_tolerance"] = float(quality.get("absolute_tolerance", 0.0))
     metrics["relative_tolerance"] = float(quality.get("relative_tolerance", 0.0))
     metrics["tolerance"] = float(metrics.get("effective_tolerance", quality.get("absolute_tolerance", 0.0)))
@@ -1691,7 +1758,7 @@ def _compound_settings(world) -> Dict[str, object]:
         "pca": False,
         "extrude": False,
         "seed": 0,
-        "algorithm": f"COACD_{COACD_VERSION}_FIXED_CLUSTER_V1",
+        "algorithm": f"COMPOUND_{COACD_EXECUTION_MODE}_{COACD_VERSION}_V4",
     })
     return result
 
@@ -1727,6 +1794,58 @@ def _inset_convex_part(vertices: Sequence[Vector], inset: float) -> Tuple[List[V
         amount = min(float(inset), length * 0.15)
         result.append(center + delta * ((length - amount) / length))
     return result, center
+
+
+def _oriented_box_from_points(
+    vertices: Sequence[Vector],
+) -> Tuple[Vector, Vector, Quaternion]:
+    """Return a deterministic local oriented box for a convex child hull."""
+    if not vertices:
+        return Vector((0.0, 0.0, 0.0)), Vector((1.0e-5, 1.0e-5, 1.0e-5)), Quaternion((1.0, 0.0, 0.0, 0.0))
+
+    def axis_aligned():
+        center, half = _bounds_center_and_half_extents(vertices)
+        return center, half, Quaternion((1.0, 0.0, 0.0, 0.0))
+
+    if _np is None or len(vertices) < 4:
+        return axis_aligned()
+    try:
+        coordinates = _np.asarray([(float(v.x), float(v.y), float(v.z)) for v in vertices], dtype=_np.float64)
+        mean = coordinates.mean(axis=0)
+        centered = coordinates - mean
+        covariance = (centered.T @ centered) / max(1, len(coordinates))
+        eigenvalues, axes = _np.linalg.eigh(covariance)
+        order = _np.argsort(eigenvalues)[::-1]
+        eigenvalues = eigenvalues[order]
+        axes = axes[:, order]
+        largest = max(1.0e-18, float(abs(eigenvalues[0])))
+        # Nearly equal eigenvalues make PCA axes arbitrary. Axis-aligned boxes
+        # are deterministic and safer for those approximately spherical parts.
+        if any(abs(float(eigenvalues[i] - eigenvalues[i + 1])) <= largest * 1.0e-7 for i in range(2)):
+            return axis_aligned()
+        for column in range(3):
+            axis = axes[:, column]
+            dominant = int(_np.argmax(_np.abs(axis)))
+            if axis[dominant] < 0.0:
+                axes[:, column] *= -1.0
+        if float(_np.linalg.det(axes)) < 0.0:
+            axes[:, 2] *= -1.0
+        projected = centered @ axes
+        minimum = projected.min(axis=0)
+        maximum = projected.max(axis=0)
+        local_center = (minimum + maximum) * 0.5
+        box_center = mean + axes @ local_center
+        half = _np.maximum((maximum - minimum) * 0.5, 1.0e-5)
+        rotation_matrix = Matrix(tuple(
+            tuple(float(axes[row, column]) for column in range(3))
+            for row in range(3)
+        ))
+        rotation = rotation_matrix.to_quaternion().normalized()
+        if rotation.w < 0.0:
+            rotation = Quaternion((-rotation.w, -rotation.x, -rotation.y, -rotation.z))
+        return Vector(tuple(map(float, box_center))), Vector(tuple(map(float, half))), rotation
+    except Exception:
+        return axis_aligned()
 
 
 def _cached_compound_data(
@@ -1780,6 +1899,7 @@ def _cached_compound_data(
                 continue
             volume = _mesh_volume_from_flat_indices(source_points, source_indices)
             radius = max(((point - center).length for point in hull_points), default=1.0e-5)
+            box_center, box_half_extents, box_rotation = _oriented_box_from_points(hull_points)
             parts.append({
                 "vertices": [_vector_list(point) for point in hull_points],
                 "indices": [],
@@ -1789,6 +1909,9 @@ def _cached_compound_data(
                 "raw_vertex_count": int(_raw_part_vertices),
                 "selected_vertex_count": int(len(hull_points)),
                 "hull_quality": part_hull_quality,
+                "box_center": _vector_list(box_center),
+                "box_half_extents": _vector_list(box_half_extents),
+                "box_rotation": [float(box_rotation.w), float(box_rotation.x), float(box_rotation.y), float(box_rotation.z)],
             })
         parts.sort(key=lambda part: (
             -float(part.get("volume", 0.0)),
@@ -1803,6 +1926,20 @@ def _cached_compound_data(
     elapsed = time.perf_counter() - started
     source_volume = max(0.0, float(geometry.get("volume_world", 0.0)))
     part_volume = sum(float(part.get("volume", 0.0)) for part in parts)
+    runtime_proxy_volume = sum(
+        max(0.0, 8.0 * float(part.get("box_half_extents", (0.0, 0.0, 0.0))[0])
+            * float(part.get("box_half_extents", (0.0, 0.0, 0.0))[1])
+            * float(part.get("box_half_extents", (0.0, 0.0, 0.0))[2]))
+        for part in parts
+    )
+    runtime_proxy_ratio = runtime_proxy_volume / source_volume if source_volume > 1.0e-12 else None
+    safe_interior_mode = str(COACD_EXECUTION_MODE).startswith("SAFE_INTERIOR")
+    quality_reasons: List[str] = []
+    if error:
+        quality_reasons.append(error)
+    if safe_interior_mode and runtime_proxy_ratio is not None and runtime_proxy_ratio > 1.02:
+        quality_reasons.append(f"safe_proxy_overfill:{runtime_proxy_ratio:.6g}")
+        parts = []
     quality = {
         "algorithm": resolved.get("algorithm"),
         "coacd_version": COACD_VERSION,
@@ -1817,13 +1954,17 @@ def _cached_compound_data(
         "source_volume": source_volume,
         "part_volume": part_volume,
         "part_to_source_volume_ratio": (part_volume / source_volume if source_volume > 1.0e-12 else None),
+        "runtime_proxy_volume": float(runtime_proxy_volume),
+        "runtime_proxy_to_source_volume_ratio": runtime_proxy_ratio,
+        "conservative_interior_proxy": bool(safe_interior_mode),
         "inset": float(resolved.get("inset", 0.0)),
         "accepted": bool(parts),
-        "fallback_reason": error,
-        "fallback_reasons": [error] if error else [],
+        "fallback_reason": (quality_reasons[0] if quality_reasons else None),
+        "fallback_reasons": quality_reasons,
         "seconds": float(elapsed),
-        "runtime_representation": "FIXED_CONVEX_CLUSTER",
+        "runtime_representation": "NATIVE_CONVEX_OR_CONSERVATIVE_INTERIOR_BOX_COMPOUND",
         "native_compound_pending": True,
+        "coacd_execution": COACD_EXECUTION_MODE,
     }
     compounds[cache_key] = {"parts": parts, "quality": quality}
     if parts:
@@ -1875,7 +2016,7 @@ def object_to_body_dict(
     compound_quality_metrics: Dict[str, object] = {}
     raw_hull_vertex_count = 0
     hull_quality_metrics: Dict[str, object] = {}
-    hull_quality = _hull_quality_settings(world)
+    hull_quality = _hull_quality_settings(world, fracture_piece=is_ka_fracture_piece(obj))
 
     # Compound Convex always keeps a single-hull fallback in the payload. This
     # makes a failed decomposition safe and also gives diagnostics a direct
@@ -1985,6 +2126,7 @@ def object_to_body_dict(
         ccd_reason = "disabled_on_body"
 
     body = {
+        "stable_id": ensure_stable_id(obj, BODY_ID_PROPERTY),
         "name": obj.name_full,
         "body_type": body_type,
         "collision_shape": collision_shape,
@@ -2044,15 +2186,15 @@ def object_to_body_dict(
 
 def enabled_body_objects(scene: bpy.types.Scene) -> List[bpy.types.Object]:
     objects = [obj for obj in scene.objects if hasattr(obj, "ka_rigid_body") and obj.ka_rigid_body.enabled]
-    # Stable body IDs matter for reproducible contact ordering. Create static
-    # collision geometry first, then kinematic bodies, then dynamic bodies.
+    stable_ids = ensure_scene_body_ids(objects)
+    # Stable UUIDs, not names, determine solver insertion order. Renaming an
+    # object therefore no longer changes contact ordering or cache identity.
     body_priority = {"STATIC": 0, "KINEMATIC": 1, "DYNAMIC": 2}
     return sorted(
         objects,
         key=lambda obj: (
             body_priority.get(str(obj.ka_rigid_body.body_type), 3),
-            obj.name_full.casefold(),
-            obj.name_full,
+            stable_ids[id(obj)],
         ),
     )
 
@@ -2363,8 +2505,15 @@ def build_scene_payload(scene: bpy.types.Scene) -> Dict:
         if body.get("skip_simulation")
     ]
     bodies = [body for body in extracted if not body.get("skip_simulation")]
+    constraints = (
+        bonds_for_enabled_bodies(scene, (str(body.get("stable_id", "")) for body in bodies))
+        if bool(getattr(world, "bond_enabled", True))
+        else []
+    )
     gravity = scene.gravity if world.use_scene_gravity else world.gravity
+    scene_id = ensure_stable_id(scene, SCENE_ID_PROPERTY)
     payload = {
+        "scene_id": scene_id,
         "scene_name": scene.name,
         "frame_start": int(world.frame_start),
         "frame_end": int(world.frame_end),
@@ -2399,6 +2548,9 @@ def build_scene_payload(scene: bpy.types.Scene) -> Dict:
             "max_mass_ratio": float(world.max_mass_ratio),
             "mass_conditioning": mass_conditioning,
             "convex_hull_max_vertices": int(world.convex_hull_max_vertices),
+            "fracture_hull_inset": float(world.fracture_hull_inset),
+            "fracture_friction": float(world.fracture_friction),
+            "bond_stability_mode": str(world.bond_stability_mode),
             "adaptive_hull_accuracy": bool(world.adaptive_hull_accuracy),
             "hull_quality_preset": str(world.hull_quality_preset),
             "hull_error_tolerance": float(world.hull_error_tolerance),
@@ -2414,8 +2566,8 @@ def build_scene_payload(scene: bpy.types.Scene) -> Dict:
             "compound_resolution": int(world.compound_resolution),
             "compound_mcts_iterations": int(world.compound_mcts_iterations),
             "compound_inset": float(world.compound_inset),
-            "compound_algorithm": f"CoACD {COACD_VERSION}",
-            "compound_runtime_representation": "FIXED_CONVEX_CLUSTER",
+            "compound_algorithm": f"{COACD_EXECUTION_MODE} / CoACD {COACD_VERSION}",
+            "compound_runtime_representation": "NATIVE_CONVEX_OR_SINGLE_BODY_OBB_COMPOUND",
             "adaptive_ccd": bool(world.adaptive_ccd),
             "ccd_max_radius": float(world.ccd_max_radius),
             "ccd_speed_threshold": float(world.ccd_speed_threshold),
@@ -2429,7 +2581,10 @@ def build_scene_payload(scene: bpy.types.Scene) -> Dict:
         },
         "skipped_bodies": skipped,
         "bodies": bodies,
+        "constraints": constraints,
     }
+    payload["simulation_scene"] = build_simulation_scene(payload, scene_id=scene_id)
+    payload["runtime"]["simulation_scene_schema"] = SIMULATION_SCENE_VERSION
     signature_started = time.perf_counter()
     payload["signature"] = scene_signature(payload)
     profile["signature_seconds"] = time.perf_counter() - signature_started
@@ -2442,6 +2597,9 @@ def build_scene_payload(scene: bpy.types.Scene) -> Dict:
 
 
 def scene_signature(payload: Dict) -> str:
+    scene = payload.get("simulation_scene")
+    if isinstance(scene, dict):
+        return canonical_scene_digest(scene)
     filtered = {
         key: value
         for key, value in payload.items()

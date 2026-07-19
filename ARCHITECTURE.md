@@ -1,4 +1,4 @@
-# Architektur 0.5.1
+# Architektur 0.6.0
 
 > Dieses Dokument beschreibt die implementierte Ist-Architektur. Die langfristige Destruction-, PhysX-, Blast-, Partikel-, Staub-, Rauch- und Feuerarchitektur ist vollständig in [`README.md`](README.md) dokumentiert.
 
@@ -242,12 +242,98 @@ Die native Runtime bleibt Culverin 0.13.2. Deren öffentliches `WorldSettings`-I
 
 `COMPOUND_CONVEX` ist eine explizite Body-Einstellung und ersetzt nicht automatisch den schnellen `CONVEX_HULL`-Standard. Die Payload-Erzeugung liest das evaluierte Mesh oder das zugewiesene Collision-Proxy-Mesh, trianguliert es und übergibt die Geometrie an die gebündelte CoACD-1.0.11-Bibliothek. Die reale Fehlertoleranz ist das Maximum aus absolutem Ziel und relativem Anteil der Bounding-Box-Diagonale.
 
-Jedes CoACD-Ergebnis wird erneut konvex verhüllt, support-fehlergesteuert auf das Vertexlimit reduziert und leicht nach innen versetzt. Der Inset verhindert interne Kontakte zwischen benachbarten Teilformen. Cache-Schlüssel enthalten Geometriesignatur, CoACD-Version, Preset, Toleranzen, Auflösungen, Part-Limit, Vertexlimit und Inset. Der persistente `KACL4`-Cache speichert die Float64-Punkte aller Teil-Hulls.
+Jedes CoACD-Ergebnis wird erneut konvex verhüllt, support-fehlergesteuert auf das Vertexlimit reduziert und leicht nach innen versetzt. Der Inset verhindert interne Kontakte zwischen benachbarten Teilformen. Cache-Schlüssel enthalten Geometriesignatur, CoACD-Version, Preset, Toleranzen, Auflösungen, Part-Limit, Vertexlimit und Inset. Der persistente `KACL5`-Cache speichert die Float64-Punkte aller Teil-Hulls.
 
-Culverin 0.13.2 stellt `create_compound_body` nur für primitive Teilformen bereit. Konvexe Hull-Kinder können damit nicht zuverlässig als ein nativer `StaticCompoundShape` erstellt werden. Der 0.5.0-Adapter bildet deshalb einen logischen Compound-Convex-Body als Cluster aus mehreren dynamischen Convex-Hull-Bodies ab. Der volumenanteilige Massenwert wird auf die Teile verteilt; der größte Teil ist der Playback-Root und alle weiteren Teile werden durch `CONSTRAINT_FIXED` gebunden. Alle nativen Handles werden demselben logischen Namen zugeordnet, interne Geschwisterkontakte werden aus Diagnosen ausgeblendet, und nur der Root-Transform wird in den Blender-Cache geschrieben.
+Culverin 0.13.2 stellt `create_compound_body` nur für primitive Teilformen bereit. Der historische 0.5.0-Adapter verwendete deshalb mehrere Convex-Hull-Bodies mit `CONSTRAINT_FIXED`. Dieser Cluster-Pfad wurde in 0.6.3 entfernt. Seit 0.6.4 erzeugt der Windows-Fallback keine Boxen mehr aus offenen Oberflächen-Clustern. Stattdessen werden ausschließlich konservative, im geschlossenen Quellmesh geprüfte Innenraum-Boxen an einen einzigen `create_compound_body`-Aufruf übergeben. Damit entstehen auch ohne ABI-v2-Bridge genau ein nativer Body, eine gemeinsame Masse/Trägheit und keine internen Constraints.
 
-Diese Darstellung ist funktional und in der Regression geprüft, erzeugt aber mehr native Bodies und Constraints als ein echter Jolt-Compound. Eine spätere Culverin-Erweiterung sollte mehrere Convex-Hull-Kinder direkt in einen Jolt `StaticCompoundShape` überführen; Payload, CoACD-Cache und UI können dabei unverändert bleiben.
+Mit installierter ABI-v2-Bridge bleiben die eigentlichen Convex-Hull-Kinder erhalten und werden in einem Jolt `StaticCompoundShape` zusammengefasst. Ohne Bridge ist die OBB-Darstellung etwas gröber, dafür stabil und frei von Geschwisterkontakten und Constraint-Drift.
+
+
+## 0.6.0 SimulationScene und nativer Jolt-Bridge
+
+`core/simulation_scene.py` definiert den ersten verbindlichen solverneutralen Vertrag. Blender extrahiert weiterhin die bewährten Geometriedaten, speichert sie anschließend aber als `ka.simulation_scene` Version 1. Die Backends erhalten ihren Kompatibilitäts-Payload ausschließlich über den Adapter `solver_payload()`. Damit ist das neue Schema bereits die Quelle der Solver-Eingabe, ohne den bestehenden Bake-/Cache-Loop gleichzeitig vollständig ersetzen zu müssen.
+
+Persistente UUIDs werden als Blender-Custom-Properties auf Szene und Bodies gespeichert. Collider- und Compound-Child-IDs werden deterministisch aus der Body-ID und ihrem Inhalt abgeleitet. Objektname und Anzeigename bleiben Metadaten; die Einfügereihenfolge in den Solver basiert auf Body-Typ und UUID. Kopierte doppelte UUIDs werden beim Szenenaufbau repariert.
+
+Der optionale native Bridge verwendet eine kleine C-ABI Version 2 zwischen Python und Jolt 5.6.0. Er unterstützt Primitive, Convex Hull, statische Triangle Meshes und echte Compound-Convex-Shapes. Bei einem CoACD-Compound werden alle Child-Hulls in ein `StaticCompoundShapeSettings` geschrieben und als genau ein Jolt-Body erzeugt. Masse und Trägheit werden damit über die Gesamtform berechnet; interne Fixed Constraints entfallen.
+
+Die Runtime sucht zuerst nach einer konfigurierten oder gebündelten ABI-v2-Bibliothek. Ist keine valide Bibliothek vorhanden, wird Culverin 0.13.2 geladen. Seit 0.6.4 erzeugt dieser Fallback genau einen Compound-Body aus konservativen Innenraum-Boxen; der frühere Fixed-Constraint-Cluster und die überfüllenden Oberflächen-OBBs werden nicht mehr verwendet. Diese Unterscheidung wird in Status und Logs ausdrücklich ausgewiesen.
+
+Der native Quellpfad liegt unter `native/jolt/`. CMake pinnt Jolt auf Tag `v5.6.0`; alternativ kann ein lokaler Source-Checkout über `KA_JOLT_SOURCE_DIR` verwendet werden. Kompilierte Bibliotheken gehören ausschließlich unter `vendor/jolt_bridge/<platform>/` oder werden über die Add-on-Einstellungen ausgewählt.
 
 ## 0.5.1 Blender Enum registration fix
 
 `collision_shape` verwendet eine statische Enum-Liste mit expliziten numerischen IDs. Ein dynamischer `items`-Callback darf in Blender nicht gleichzeitig einen String-`default` besitzen; genau diese Kombination verhinderte in 0.5.0 die Registrierung der `KA_RIGID_BodySettings`. Die IDs 0–4 entsprechen der Reihenfolge bis 0.4.9, `COMPOUND_CONVEX` verwendet die neue ID 5.
+
+
+### 0.6.4 Initial-Overlap-Schutz
+
+Der Collider-Aufbau akzeptiert native-freie Compound-Proxys nur, wenn ihr berechnetes Runtime-Volumen höchstens 102 % des geschlossenen Quellvolumens beträgt. Zusätzlich sammelt der Jolt-Adapter im ersten simulierten Frame immer Kontaktstatistiken für Compound-Szenen. Überschreiten neue Kontakte oder Kontakt-Ereignisse eine körperzahlabhängige Schwelle, verwirft der Operator den ersten Lauf und backt die Compound-Bodies automatisch mit ihren vorbereiteten Single-Hull-Fallbacks neu. Der ausgegebene Cache enthält deshalb keine bekannte initiale Überlappungs-Explosion.
+
+Cache-Frame 1 wird nicht aus Culverins anfangs noch leeren Transform-Puffern gelesen, sondern direkt aus den unveränderlichen Blender-Eingangstransformationen aufgebaut.
+
+### 0.6.5 Anti-Stick-Materialprofil
+
+Die 0.6.4-Innenraum-Proxys verhindern anfängliche Collider-Explosionen, beseitigen aber nicht automatisch statische Reibungsverbände in einem dichten Fragmenthaufen. Der reale Testcache zeigte lang anhaltende Kontakte mit fast horizontalen Normalen und nur wenigen Millimetern pro Sekunde Relativbewegung. Solche Paare konnten als gemeinsame Jolt-Insel einschlafen und visuell wie verklebt wirken.
+
+Erkannte KA-Fracture-Bodies verwenden deshalb bei neuer Zuweisung ein eigenes Materialprofil mit 0,20 Reibung. Die Einstellung bleibt pro Body gespeichert und kann weiterhin individuell überschrieben werden. Zusätzlich beträgt der Standardwert für `mPenetrationSlop` nun 1 mm statt 5 mm. Die Migration verändert ausschließlich die früheren exakten Standardwerte, damit bewusst eingestellte Materialparameter unverändert bleiben.
+
+
+
+## 0.7.0 Breakable Bonds MVP
+
+Breakable cohesion is stored as a solver-neutral graph in `SimulationScene.constraints`. Every bond has a stable UUID, two stable body UUIDs, a world-space anchor and normal, estimated contact area, independent force and torque limits, optional accumulated damage, and a deterministic intact/broken state. The Blender scene persists the authored graph as compact JSON; object names are metadata only.
+
+The authoring operator builds proximity bonds from evaluated world-space mesh vertices. AABB sweep pruning limits candidate pairs. A valid connection requires at least three nearby samples and measurable non-collinear surface support, so meshes touching only at one point or along a single edge are not intentionally bonded.
+
+In `Flexible` mode Culverin 0.13.2 creates a bounded native Jolt Fixed-constraint network. In `Rigid` mode every connected intact dynamic bond component is instead represented by one native compound actor, while the complete authored graph remains solver-neutral runtime state. Culverin does not expose constraint reaction lambdas, therefore both modes evaluate external contact impulse per solver substep. The impulse is converted to an estimated force using the substep duration, distributed across the intact bonds of the impacted logical fragment, projected against the bond orientation and converted to an estimated torque around the bond anchor. Exceeding either threshold marks the bond broken and emits a deterministic `BOND_BREAK` event. Optional damage accumulation integrates repeated subcritical loading above a fixed activation ratio.
+
+The ABI-v2 bridge currently has no external-constraint ABI. Bond scenes therefore select the bundled Culverin runtime even when ABI-v2 is installed. Exact reaction-force fracture remains a later ABI extension.
+
+## 0.7.6 Authored Ground Rest
+
+A zero-velocity `Rigid` bond component can already be authored in a valid resting pose on a managed horizontal ground plane. Creating that actor active allowed gravity and conservative proxy contacts to make it settle and rock for several frames before Jolt's native sleep threshold was reached. The visible mesh could consequently sink or tilt even though the intended initial pose was already stable.
+
+The backend now evaluates the lowest world-space collider support against managed plane height during the initial rigid-cluster build. A component within the narrow support tolerance is created with zero velocity, assigned Culverin's geometrically recentered transform, and immediately deactivated. Logical fragment transforms therefore remain exactly equal to cache frame 1. This path is used only during initial construction; actors rebuilt after bond fracture remain active. Jolt automatically wakes the sleeping compound when another active body strikes it.
+
+Diagnostics count these initial deactivations as `bond_supported_cluster_deactivations`. Regression coverage verifies both exact pose retention and impact wake-up.
+
+## 0.7.5 Safe Single-Hull Children in Rigid Islands
+
+A rigid bond island is still represented by one native compound actor. Culverin cannot attach arbitrary convex-hull children to that actor, so a `CONVEX_HULL` fallback must be converted to primitive children. Version 0.7.4 used the source mesh half-extents for this conversion. Those extents can be much larger than the fitted/inset hull and may cross the ground even when the actual convex collider does not.
+
+Version 0.7.5 reconstructs deterministic support planes from the fallback hull vertices. It places a central sphere and inward-offset vertex spheres whose radii are limited by the nearest support plane. Every generated primitive is therefore contained by the convex hull. The original convex body is still used when a fragment becomes a standalone actor after fracture; the sphere cloud is limited to the temporary one-body rigid-island representation.
+
+## 0.7.4 Rigid Compound Bond Islands
+
+`Rigid` cohesion no longer approximates a solid object with a network of iterative constraints. Every connected intact dynamic bond component is merged into one native dynamic compound actor. Logical fragments retain their own transforms, stable IDs, masses, collider parts and bond endpoints, but their visible transforms are reconstructed from immutable local frames inside the actor. Relative translation and rotation are therefore mathematically zero while the graph remains connected.
+
+Contact events emitted for the compound actor are assigned to the nearest logical member at the reported contact position. The existing impulse-based fracture estimator can therefore continue to load local bonds. After one or more bonds break, connected components are recomputed, the old actor is destroyed, and every resulting component is rebuilt as either a new compound actor or a normal singleton body. Linear and angular velocity are transferred to the new actors.
+
+Culverin recentres compound actor poses to the volume-weighted centre of their primitive children. The backend compensates logical member frames for this shift while keeping the supplied actor position at the island mass centre. This prevents jumps for unequal fragment masses and during graph splits.
+
+The 256-constraint world limit now applies only to `Flexible`; `Rigid` creates no Fixed constraints. Internal collision filtering and coordinated multi-body sleep are unnecessary in `Rigid`, because one native actor has neither sibling contacts nor partial sleeping members.
+
+## 0.7.3 Native Bond Islands and Coordinated Sleep
+
+Version 0.7.3 removes the post-step transform projection introduced for rigid bond islands. Repositioning every member after each contact solve created a feedback loop between contact correction, Fixed constraints and the projection pass; on dense asymmetric compound colliders this injected angular and linear energy into the complete object.
+
+`Rigid` now relies exclusively on the deterministic native Fixed-constraint spanning forest plus reinforcement edges. The intact graph receives collision filtering as before, but no member transform or velocity is overwritten after a solver step. Once a connected intact component is supported only by static or kinematic contacts and its aggregate motion remains below the settle limits, every dynamic member is zeroed and deactivated in one batch. This avoids the unstable partial-sleep state in which active constraints pull against already sleeping fragments. `Flexible` retains native constraints without this coordinated whole-island sleep gate.
+
+Projection diagnostic fields remain in bake totals for cache/log compatibility and stay at zero.
+
+## 0.7.2 Bond-Island Collision Filtering
+
+Intact fracture fragments must not solve contacts against other members of the same intact bond component. Otherwise the contact solver separates overlapping or merely touching collider approximations, while the rigid post-step projection immediately restores the authored relative pose. Repeating those opposing corrections injects momentum into the complete cluster and prevents reliable rest.
+
+The Culverin fallback therefore assigns every intact multi-body bond component a deterministic free collision-category bit and rebuilds all masks from the original per-body layer/mask compatibility. Members of one intact component exclude their own component category. External bodies and different components remain compatible. When bond damage disconnects the graph, filters are rebuilt immediately; the newly separate components regain mutual collision. Singletons revert to their original category.
+
+The current 16-bit filter space supports up to fifteen simultaneous filtered multi-body components when the normal default category occupies one bit. Overflow components retain their original filters rather than disabling unrelated collisions.
+
+## 0.7.1 Rigid Bond Islands
+
+Culverin 0.13.2 has a hard limit of 256 constraints per world. Dense fracture assets can contain substantially more authored bonds, so simply creating constraints in UUID order produces arbitrary holes in the mechanical graph. Version 0.7.1 first builds a maximum-area spanning forest over every authored bond island and then spends the remaining native budget on the largest unused interfaces. All authored bonds remain runtime records even when they do not own a native constraint.
+
+Version 0.7.1 initially added a post-step rigid transform projection to suppress visible joint stretch. Version 0.7.3 removes that mechanism because solver/projection feedback could inject global drift into dense compound fracture assets. Native Fixed constraints now provide the mechanical cohesion, while `Rigid` adds coordinated whole-island settling.
+
+Bond anchors and normals are stored author-side in Blender world coordinates but converted at bake initialization into local frames for both endpoint bodies. Force alignment and torque levers use the current transformed anchor, not the original world point. Contact samples whose other body belongs to the same intact bond component are classified as internal and excluded from the external fracture-load estimate.

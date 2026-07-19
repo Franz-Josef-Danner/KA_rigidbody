@@ -8,12 +8,27 @@ import math
 import os
 import time
 import tempfile
+import uuid
 from typing import Any, Dict, List
 
 from ..backends.jolt import JoltBackend, recommended_jolt_threads
 from .determinism import compare_frames, frames_digest
 from .cache import decode_direct_frame_block, write_cache, read_cache
 from .coacd_bridge import coacd_status, decompose as coacd_decompose
+from .stability_defaults import (
+    FRACTURE_CONTACT_FRICTION_DEFAULT,
+    LEGACY_BODY_FRICTION_DEFAULT,
+    PENETRATION_SLOP_DEFAULT,
+)
+from .simulation_scene import (
+    SIMULATION_SCENE_SCHEMA,
+    SIMULATION_SCENE_VERSION,
+    apply_single_hull_fallback,
+    build_simulation_scene,
+    canonical_scene_digest,
+    solver_payload,
+    validate_simulation_scene,
+)
 
 REGRESSION_FILENAME = "ka_rigid_regression.json"
 
@@ -133,6 +148,106 @@ def _final_location(result: Dict[str, Any], name: str):
 
 
 
+def _run_simulation_scene_roundtrip(_backend: JoltBackend) -> Dict[str, Any]:
+    bodies = [
+        _body("NeutralGround", "STATIC", "PLANE", (0.0, 0.0, 0.0)),
+        _body("NeutralCompound", "DYNAMIC", "COMPOUND_CONVEX", (0.0, 0.0, 1.0)),
+    ]
+    bodies[0]["stable_id"] = "dd6ab746-3de8-5d4e-b808-8fd84783f146"
+    bodies[1]["stable_id"] = "1df585ef-bf70-51dd-a890-51f81272bbd9"
+    payload = _payload("simulation-scene", bodies, frames=12, substeps=2)
+    payload["scene_id"] = "b23023cf-f7bd-5cab-bad5-91a65cdf15a2"
+    scene = build_simulation_scene(payload, scene_id=payload["scene_id"])
+    validate_simulation_scene(scene)
+    payload["simulation_scene"] = scene
+    restored = solver_payload(payload)
+    compound = restored["bodies"][1]
+    child_ids = [part.get("stable_id") for part in compound.get("compound_parts", [])]
+    passed = (
+        scene.get("schema") == SIMULATION_SCENE_SCHEMA
+        and int(scene.get("schema_version", 0)) == SIMULATION_SCENE_VERSION
+        and len(scene.get("bodies", [])) == 2
+        and len(scene.get("materials", [])) == 1
+        and compound.get("collision_shape") == "COMPOUND_CONVEX"
+        and len(child_ids) == 2
+        and len(set(child_ids)) == 2
+        and all(child_ids)
+        and canonical_scene_digest(scene) == canonical_scene_digest(copy.deepcopy(scene))
+    )
+    return {
+        "name": "SimulationScene v1 roundtrip",
+        "passed": bool(passed),
+        "metrics": {
+            "schema": scene.get("schema"),
+            "schema_version": scene.get("schema_version"),
+            "body_count": len(scene.get("bodies", [])),
+            "material_count": len(scene.get("materials", [])),
+            "compound_child_ids": child_ids,
+        },
+    }
+
+
+
+def _run_simulation_scene_runtime_fallback(_backend: JoltBackend) -> Dict[str, Any]:
+    body = _body("FallbackCompound", "DYNAMIC", "COMPOUND_CONVEX", (0.0, 0.0, 1.0))
+    body["stable_id"] = "1df585ef-bf70-51dd-a890-51f81272bbd9"
+    payload = _payload("simulation-scene-fallback", [body], frames=4, substeps=2)
+    scene = build_simulation_scene(payload, scene_id="b23023cf-f7bd-5cab-bad5-91a65cdf15a2")
+    original_collider_id = scene["bodies"][0]["colliders"][0]["stable_id"]
+    payload["simulation_scene"] = scene
+    changed = apply_single_hull_fallback(
+        scene, payload["bodies"], ["FallbackCompound"], reason="regression_initial_overlap"
+    )
+    restored = solver_payload(payload)
+    restored_body = restored["bodies"][0]
+    collider = scene["bodies"][0]["colliders"][0]
+    passed = (
+        changed == 1
+        and collider.get("shape_type") == "CONVEX_HULL"
+        and collider.get("stable_id") == original_collider_id
+        and bool(collider.get("fallback"))
+        and restored_body.get("collision_shape") == "CONVEX_HULL"
+        and len(restored_body.get("convex_vertices", [])) >= 4
+        and collider.get("compound_quality", {}).get("fallback_reason") == "regression_initial_overlap"
+    )
+    return {
+        "name": "SimulationScene runtime fallback",
+        "passed": bool(passed),
+        "metrics": {
+            "changed": changed,
+            "shape": restored_body.get("collision_shape"),
+            "collider_id_preserved": collider.get("stable_id") == original_collider_id,
+            "vertex_count": len(restored_body.get("convex_vertices", [])),
+        },
+    }
+
+def _run_simulation_scene_identity(_backend: JoltBackend) -> Dict[str, Any]:
+    stable_id = "1df585ef-bf70-51dd-a890-51f81272bbd9"
+    scene_id = "b23023cf-f7bd-5cab-bad5-91a65cdf15a2"
+    first_body = _body("BeforeRename", "DYNAMIC", "BOX", (0.0, 0.0, 1.0))
+    first_body["stable_id"] = stable_id
+    second_body = copy.deepcopy(first_body)
+    second_body["name"] = "AfterRename"
+    first = build_simulation_scene(_payload("identity-a", [first_body]), scene_id=scene_id)
+    second = build_simulation_scene(_payload("identity-b", [second_body]), scene_id=scene_id)
+    first_record = first["bodies"][0]
+    second_record = second["bodies"][0]
+    passed = (
+        first_record["stable_id"] == second_record["stable_id"] == stable_id
+        and first_record["colliders"][0]["stable_id"] == second_record["colliders"][0]["stable_id"]
+        and first_record["display_name"] != second_record["display_name"]
+    )
+    return {
+        "name": "Stable body and collider identity",
+        "passed": bool(passed),
+        "metrics": {
+            "body_id": first_record["stable_id"],
+            "collider_id": first_record["colliders"][0]["stable_id"],
+            "renamed_to": second_record["display_name"],
+        },
+    }
+
+
 def _run_coacd_decomposition(_backend: JoltBackend) -> Dict[str, Any]:
     polygon = [(0.0, 0.0), (2.0, 0.0), (2.0, 1.0), (1.0, 1.0), (1.0, 2.0), (0.0, 2.0)]
     vertices = [[x, y, z] for z in (0.0, 0.5) for x, y in polygon]
@@ -145,9 +260,10 @@ def _run_coacd_decomposition(_backend: JoltBackend) -> Dict[str, Any]:
     indices = [value for triangle in (bottom + top + sides) for value in triangle]
     available, detail = coacd_status()
     if not available:
-        return {"name": "Bundled CoACD decomposition", "passed": False, "error": detail, "metrics": {}}
+        return {"name": "Safe compound decomposition", "passed": False, "error": detail, "metrics": {}}
     parts = coacd_decompose(vertices, indices, {
         "threshold": 0.01,
+        "execution_mode": "SAFE_SPATIAL",
         "max_parts": 4,
         "preprocess_mode": "AUTO",
         "preprocess_resolution": 30,
@@ -162,11 +278,32 @@ def _run_coacd_decomposition(_backend: JoltBackend) -> Dict[str, Any]:
     })
     part_count = len(parts)
     vertex_counts = [len(part.get("vertices", [])) for part in parts]
-    passed = 2 <= part_count <= 4 and all(count >= 4 for count in vertex_counts)
+    proxy_volume = 0.0
+    for part in parts:
+        points = list(part.get("vertices", []))
+        xs = [float(point[0]) for point in points]
+        ys = [float(point[1]) for point in points]
+        zs = [float(point[2]) for point in points]
+        if xs and ys and zs:
+            proxy_volume += (max(xs) - min(xs)) * (max(ys) - min(ys)) * (max(zs) - min(zs))
+    source_volume = 1.5
+    volume_ratio = proxy_volume / source_volume
+    passed = (
+        2 <= part_count <= 4
+        and all(count == 8 for count in vertex_counts)
+        and 0.0 < volume_ratio <= 1.02
+    )
     return {
-        "name": "Bundled CoACD decomposition",
+        "name": "Safe compound decomposition",
         "passed": passed,
-        "metrics": {"part_count": part_count, "vertex_counts": vertex_counts, "status": detail},
+        "metrics": {
+            "part_count": part_count,
+            "vertex_counts": vertex_counts,
+            "proxy_volume": proxy_volume,
+            "source_volume": source_volume,
+            "proxy_volume_ratio": volume_ratio,
+            "status": detail,
+        },
     }
 
 def _run_drop(backend: JoltBackend) -> Dict[str, Any]:
@@ -219,6 +356,499 @@ def _run_friction(backend: JoltBackend) -> Dict[str, Any]:
     passed = low_x > high_x + 0.2
     return {"name": "Friction separation", "passed": passed, "metrics": {"low_friction_x": low_x, "high_friction_x": high_x}}
 
+
+def _run_fracture_antistick_contact(backend: JoltBackend) -> Dict[str, Any]:
+    """Verify the new fracture material can slide out of a sustained side contact."""
+    bodies = [
+        _body("Wall", "STATIC", "BOX", (0.0, 0.0, 1.5), half_extents=(0.1, 3.0, 3.0), friction=0.8),
+        _body(
+            "AntiStick", "DYNAMIC", "BOX", (0.31, -0.5, 2.5),
+            half_extents=(0.2, 0.2, 0.2), friction=FRACTURE_CONTACT_FRICTION_DEFAULT,
+        ),
+        _body(
+            "LegacyFriction", "DYNAMIC", "BOX", (0.31, 0.5, 2.5),
+            half_extents=(0.2, 0.2, 0.2), friction=LEGACY_BODY_FRICTION_DEFAULT,
+        ),
+    ]
+    payload = _payload(
+        "fracture-antistick-contact", bodies, frames=45, gravity=(-6.0, 0.0, -9.81), substeps=8
+    )
+    payload["penetration_slop"] = PENETRATION_SLOP_DEFAULT
+    result = backend.bake(payload)
+    anti_stick_z = float(_final_location(result, "AntiStick")[2])
+    legacy_z = float(_final_location(result, "LegacyFriction")[2])
+    release_distance = legacy_z - anti_stick_z
+    passed = release_distance > 0.20
+    return {
+        "name": "Fracture anti-stick contact",
+        "passed": passed,
+        "metrics": {
+            "anti_stick_friction": FRACTURE_CONTACT_FRICTION_DEFAULT,
+            "legacy_friction": LEGACY_BODY_FRICTION_DEFAULT,
+            "penetration_slop": PENETRATION_SLOP_DEFAULT,
+            "anti_stick_final_z": anti_stick_z,
+            "legacy_final_z": legacy_z,
+            "release_distance": release_distance,
+        },
+    }
+
+
+def _run_rigid_bond_island(backend: JoltBackend) -> Dict[str, Any]:
+    bodies = [
+        _body("BondA", "DYNAMIC", "BOX", (-1.0, 0.0, 2.0), velocity=(3.0, 0.0, 0.0)),
+        _body("BondB", "DYNAMIC", "BOX", (0.0, 0.0, 2.0)),
+        _body("BondC", "DYNAMIC", "BOX", (1.0, 0.0, 2.0)),
+    ]
+    body_ids = [str(uuid.uuid5(uuid.NAMESPACE_DNS, f"ka-rigid-bond-{index}")) for index in range(3)]
+    for body, stable_id in zip(bodies, body_ids):
+        body["stable_id"] = stable_id
+        body["linear_damping"] = 0.0
+        body["angular_damping"] = 0.0
+    payload = _payload("rigid-bond-island", bodies, frames=30, gravity=(0.0, 0.0, 0.0), substeps=6)
+    payload["sleep_enabled"] = False
+    payload["stability"] = {"bond_stability_mode": "RIGID"}
+    payload["constraints"] = [
+        {
+            "stable_id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"ka-rigid-bond-edge-{index}")),
+            "constraint_type": "BREAKABLE_FIXED",
+            "body_a": body_ids[index],
+            "body_b": body_ids[index + 1],
+            "body_a_name": bodies[index]["name"],
+            "body_b_name": bodies[index + 1]["name"],
+            "anchor": [float(index) - 0.5, 0.0, 2.0],
+            "normal": [1.0, 0.0, 0.0],
+            "area": 1.0,
+            "break_force": 1.0e12,
+            "break_torque": 1.0e12,
+            "damage_accumulation": 0.0,
+            "damage": 0.0,
+            "enabled": True,
+        }
+        for index in range(2)
+    ]
+    result = backend.bake(payload)
+    maximum_distance_error = 0.0
+    maximum_rotation_error = 0.0
+    for snapshot in result["frames"].values():
+        locations = [snapshot[name]["location"] for name in ("BondA", "BondB", "BondC")]
+        rotations = [snapshot[name]["rotation"] for name in ("BondA", "BondB", "BondC")]
+        maximum_distance_error = max(
+            maximum_distance_error,
+            abs(math.dist(locations[0], locations[1]) - 1.0),
+            abs(math.dist(locations[1], locations[2]) - 1.0),
+        )
+        for rotation in rotations[1:]:
+            dot = abs(sum(float(a) * float(b) for a, b in zip(rotations[0], rotation)))
+            maximum_rotation_error = max(maximum_rotation_error, 1.0 - min(1.0, dot))
+    totals = result.get("diagnostic_totals", {})
+    passed = (
+        maximum_distance_error <= 1.0e-5
+        and maximum_rotation_error <= 1.0e-6
+        and int(totals.get("bond_graph_count", 0)) == 2
+        and int(totals.get("bond_constraint_count", -1)) == 0
+        and int(totals.get("bond_cluster_count", 0)) == 1
+        and int(totals.get("bond_clustered_bodies", 0)) == 3
+        and int(totals.get("native_dynamic_body_count", 0)) == 1
+        and bool(totals.get("bond_rigid_stabilization"))
+        and totals.get("bond_stabilization_strategy") == "RIGID_COMPOUND_ISLANDS"
+        and int(totals.get("bond_projection_passes", -1)) == 0
+    )
+    return {
+        "name": "Rigid bond island",
+        "passed": bool(passed),
+        "metrics": {
+            "maximum_distance_error": maximum_distance_error,
+            "maximum_rotation_error": maximum_rotation_error,
+            "bond_graph_count": totals.get("bond_graph_count"),
+            "bond_constraint_count": totals.get("bond_constraint_count"),
+            "bond_cluster_count": totals.get("bond_cluster_count"),
+            "bond_clustered_bodies": totals.get("bond_clustered_bodies"),
+            "native_dynamic_body_count": totals.get("native_dynamic_body_count"),
+            "strategy": totals.get("bond_stabilization_strategy"),
+            "projection_passes": totals.get("bond_projection_passes"),
+        },
+    }
+
+
+def _run_rigid_bond_collision_filter(backend: JoltBackend) -> Dict[str, Any]:
+    """Intact bond members must not generate internal contact impulses."""
+    bodies = [
+        _body("FilterA", "DYNAMIC", "BOX", (-0.45, 0.0, 1.0), half_extents=(0.5, 0.5, 0.5), mass=5.0),
+        _body("FilterB", "DYNAMIC", "BOX", (0.35, 0.0, 1.0), half_extents=(0.5, 0.5, 0.5), mass=1.0),
+        _body("FilterC", "DYNAMIC", "BOX", (1.15, 0.0, 1.0), half_extents=(0.5, 0.5, 0.5), mass=0.5),
+    ]
+    body_ids = [str(uuid.uuid5(uuid.NAMESPACE_DNS, f"ka-rigid-filter-{index}")) for index in range(3)]
+    for body, stable_id in zip(bodies, body_ids):
+        body["stable_id"] = stable_id
+        body["linear_damping"] = 0.0
+        body["angular_damping"] = 0.0
+    payload = _payload("rigid-bond-collision-filter", bodies, frames=10, gravity=(0.0, 0.0, 0.0), substeps=4)
+    payload["sleep_enabled"] = False
+    payload["diagnostics"] = {"enabled": True, "contacts": True, "payload": False}
+    payload["stability"] = {"bond_stability_mode": "RIGID"}
+    payload["constraints"] = [
+        {
+            "stable_id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"ka-rigid-filter-edge-{index}")),
+            "constraint_type": "BREAKABLE_FIXED",
+            "body_a": body_ids[index],
+            "body_b": body_ids[index + 1],
+            "body_a_name": bodies[index]["name"],
+            "body_b_name": bodies[index + 1]["name"],
+            "anchor": [float(index) * 0.8 - 0.05, 0.0, 1.0],
+            "normal": [1.0, 0.0, 0.0],
+            "area": 1.0,
+            "break_force": 1.0e12,
+            "break_torque": 1.0e12,
+            "damage_accumulation": 0.0,
+            "damage": 0.0,
+            "enabled": True,
+        }
+        for index in range(2)
+    ]
+    result = backend.bake(payload)
+    totals = result.get("diagnostic_totals", {})
+    maximum_displacement = 0.0
+    first = result["frames"]["1"]
+    final = result["frames"][str(result["frame_end"])]
+    for body in bodies:
+        name = body["name"]
+        maximum_displacement = max(
+            maximum_displacement,
+            math.dist(first[name]["location"], final[name]["location"]),
+        )
+    passed = (
+        int(totals.get("contact_events", -1)) == 0
+        and not bool(totals.get("bond_internal_collision_filtering"))
+        and int(totals.get("bond_cluster_count", 0)) == 1
+        and int(totals.get("bond_clustered_bodies", 0)) == 3
+        and int(totals.get("native_dynamic_body_count", 0)) == 1
+        and totals.get("bond_stabilization_strategy") == "RIGID_COMPOUND_ISLANDS"
+        and maximum_displacement <= 1.0e-6
+    )
+    return {
+        "name": "Rigid bond internal collision filter",
+        "passed": bool(passed),
+        "metrics": {
+            "contact_events": totals.get("contact_events"),
+            "cluster_count": totals.get("bond_cluster_count"),
+            "clustered_bodies": totals.get("bond_clustered_bodies"),
+            "native_dynamic_body_count": totals.get("native_dynamic_body_count"),
+            "strategy": totals.get("bond_stabilization_strategy"),
+            "maximum_displacement": maximum_displacement,
+        },
+    }
+
+
+
+def _run_rigid_bond_island_sleep(backend: JoltBackend) -> Dict[str, Any]:
+    """A supported intact island must settle as one unit without projection drift."""
+    bodies = [
+        _body("IslandGround", "STATIC", "PLANE", (0.0, 0.0, 0.0), half_extents=(10.0, 10.0, 1.0e-5), friction=0.7),
+        _body("IslandA", "DYNAMIC", "BOX", (-0.5, 0.0, 0.5), half_extents=(0.5, 0.5, 0.5), mass=1.0, friction=0.7),
+        _body("IslandB", "DYNAMIC", "BOX", (0.5, 0.0, 0.5), half_extents=(0.5, 0.5, 0.5), mass=1.0, friction=0.7),
+    ]
+    body_ids = [str(uuid.uuid5(uuid.NAMESPACE_DNS, f"ka-rigid-island-sleep-{index}")) for index in range(2)]
+    for body, stable_id in zip(bodies[1:], body_ids):
+        body["stable_id"] = stable_id
+        body["linear_damping"] = 0.1
+        body["angular_damping"] = 0.1
+    payload = _payload("rigid-bond-island-sleep", bodies, frames=60, substeps=6)
+    payload["early_sleep_termination"] = False
+    payload["sleep_time"] = 0.25
+    payload["stability"] = {"bond_stability_mode": "RIGID"}
+    payload["constraints"] = [{
+        "stable_id": str(uuid.uuid5(uuid.NAMESPACE_DNS, "ka-rigid-island-sleep-edge")),
+        "constraint_type": "BREAKABLE_FIXED",
+        "body_a": body_ids[0],
+        "body_b": body_ids[1],
+        "body_a_name": "IslandA",
+        "body_b_name": "IslandB",
+        "anchor": [0.0, 0.0, 0.5],
+        "normal": [1.0, 0.0, 0.0],
+        "area": 1.0,
+        "break_force": 1.0e12,
+        "break_torque": 1.0e12,
+        "damage_accumulation": 0.0,
+        "damage": 0.0,
+        "enabled": True,
+    }]
+    result = backend.bake(payload)
+    totals = result.get("diagnostic_totals", {})
+    first = result["frames"]["1"]
+    final = result["frames"][str(result["frame_end"])]
+    maximum_displacement = max(
+        math.dist(first[name]["location"], final[name]["location"])
+        for name in ("IslandA", "IslandB")
+    )
+    passed = (
+        int(totals.get("bond_projection_passes", -1)) == 0
+        and float(totals.get("bond_projection_max_correction", -1.0)) == 0.0
+        and int(result.get("final_state", {}).get("sleeping_bodies", 0)) == 2
+        and float(totals.get("final_motion_energy_proxy", 1.0)) == 0.0
+        and maximum_displacement <= 1.0e-5
+        and int(totals.get("bond_cluster_count", 0)) == 1
+        and int(totals.get("native_dynamic_body_count", 0)) == 1
+        and totals.get("bond_stabilization_strategy") == "RIGID_COMPOUND_ISLANDS"
+    )
+    return {
+        "name": "Rigid bond island coordinated sleep",
+        "passed": bool(passed),
+        "metrics": {
+            "projection_passes": totals.get("bond_projection_passes"),
+            "projection_max_correction": totals.get("bond_projection_max_correction"),
+            "sleeping_bodies": result.get("final_state", {}).get("sleeping_bodies"),
+            "cluster_count": totals.get("bond_cluster_count"),
+            "native_dynamic_body_count": totals.get("native_dynamic_body_count"),
+            "final_motion_energy_proxy": totals.get("final_motion_energy_proxy"),
+            "maximum_displacement": maximum_displacement,
+            "strategy": totals.get("bond_stabilization_strategy"),
+        },
+    }
+
+def _run_rigid_hull_fallback_ground_contact(backend: JoltBackend) -> Dict[str, Any]:
+    """Rigid islands must not replace a convex fallback with a penetrating outer box."""
+    ground = _body(
+        "HullGround", "STATIC", "PLANE", (0.0, 0.0, 0.0),
+        half_extents=(10.0, 10.0, 1.0e-5), friction=0.7,
+    )
+    hull = _body(
+        "HullFallback", "DYNAMIC", "CONVEX_HULL", (0.0, 0.0, 0.0),
+        half_extents=(0.5, 0.5, 0.45), mass=2.0, friction=0.7,
+    )
+    hull["stable_id"] = str(uuid.uuid5(uuid.NAMESPACE_DNS, "ka-rigid-hull-fallback"))
+    hull["shape_center"] = [0.0, 0.0, 0.28]
+    # The true hull is entirely above the plane, while the source-mesh bounds
+    # deliberately extend below it. Version 0.7.4 used those stale bounds as a
+    # cluster child and depenetrated the complete island by roughly 15 cm.
+    hull["convex_vertices"] = [
+        [-0.45, -0.25, 0.03], [0.42, -0.28, 0.04],
+        [-0.38, 0.30, 0.02], [0.40, 0.27, 0.05],
+        [-0.30, -0.22, 0.48], [0.33, -0.20, 0.52],
+        [-0.27, 0.24, 0.50], [0.29, 0.22, 0.49],
+        [0.0, 0.0, 0.62],
+    ]
+    top = _body(
+        "HullTop", "DYNAMIC", "BOX", (0.0, 0.0, 0.85),
+        half_extents=(0.15, 0.15, 0.15), mass=1.0, friction=0.7,
+    )
+    top["stable_id"] = str(uuid.uuid5(uuid.NAMESPACE_DNS, "ka-rigid-hull-top"))
+    payload = _payload(
+        "rigid-hull-fallback-ground", [ground, hull, top],
+        frames=8, gravity=(0.0, 0.0, 0.0), substeps=4,
+    )
+    payload["sleep_enabled"] = False
+    payload["early_sleep_termination"] = False
+    payload["diagnostics"] = {"enabled": True, "contacts": True, "payload": False}
+    payload["stability"] = {"bond_stability_mode": "RIGID"}
+    payload["constraints"] = [{
+        "stable_id": str(uuid.uuid5(uuid.NAMESPACE_DNS, "ka-rigid-hull-fallback-edge")),
+        "constraint_type": "BREAKABLE_FIXED",
+        "body_a": hull["stable_id"],
+        "body_b": top["stable_id"],
+        "body_a_name": hull["name"],
+        "body_b_name": top["name"],
+        "anchor": [0.0, 0.0, 0.6],
+        "normal": [0.0, 0.0, 1.0],
+        "area": 1.0,
+        "break_force": 1.0e12,
+        "break_torque": 1.0e12,
+        "damage_accumulation": 0.0,
+        "damage": 0.0,
+        "enabled": True,
+    }]
+    result = backend.bake(payload)
+    first_z = float(result["frames"]["1"][hull["name"]]["location"][2])
+    maximum_upward_shift = max(
+        float(snapshot[hull["name"]]["location"][2]) - first_z
+        for snapshot in result["frames"].values()
+    )
+    totals = result.get("diagnostic_totals", {})
+    passed = (
+        maximum_upward_shift <= 1.0e-4
+        and int(totals.get("contact_events", -1)) == 0
+        and int(totals.get("bond_cluster_count", 0)) == 1
+        and int(totals.get("native_dynamic_body_count", 0)) == 1
+        and totals.get("bond_stabilization_strategy") == "RIGID_COMPOUND_ISLANDS"
+    )
+    return {
+        "name": "Rigid hull fallback ground contact",
+        "passed": bool(passed),
+        "metrics": {
+            "maximum_upward_shift": maximum_upward_shift,
+            "contact_events": totals.get("contact_events"),
+            "cluster_count": totals.get("bond_cluster_count"),
+            "native_dynamic_body_count": totals.get("native_dynamic_body_count"),
+            "strategy": totals.get("bond_stabilization_strategy"),
+        },
+    }
+
+
+
+def _run_rigid_authored_ground_rest(backend: JoltBackend) -> Dict[str, Any]:
+    """A zero-velocity rigid island authored on managed ground must not settle."""
+    ground = _body(
+        "RestGround", "STATIC", "PLANE", (0.0, 0.0, 0.0),
+        half_extents=(10.0, 10.0, 1.0e-5), friction=0.7,
+    )
+    ground["managed_ground"] = True
+    base = _body(
+        "RestBase", "DYNAMIC", "CONVEX_HULL", (0.0, 0.0, 0.0),
+        half_extents=(0.35, 0.30, 0.30), mass=8.0, friction=0.7,
+    )
+    base["stable_id"] = str(uuid.uuid5(uuid.NAMESPACE_DNS, "ka-rigid-authored-rest-base"))
+    base["shape_center"] = [0.0, 0.0, 0.24]
+    base["convex_vertices"] = [
+        [-0.32, -0.26, 0.0006], [0.31, -0.25, 0.0007],
+        [-0.30, 0.27, 0.0008], [0.32, 0.26, 0.00065],
+        [-0.24, -0.20, 0.48], [0.25, -0.19, 0.50],
+        [-0.23, 0.21, 0.49], [0.24, 0.20, 0.51],
+    ]
+    top = _body(
+        "RestTop", "DYNAMIC", "BOX", (0.0, 0.0, 0.72),
+        half_extents=(0.16, 0.16, 0.16), mass=2.0, friction=0.7,
+    )
+    top["stable_id"] = str(uuid.uuid5(uuid.NAMESPACE_DNS, "ka-rigid-authored-rest-top"))
+    payload = _payload(
+        "rigid-authored-ground-rest", [ground, base, top],
+        frames=30, gravity=(0.0, 0.0, -9.81), substeps=6,
+    )
+    payload["early_sleep_termination"] = False
+    payload["stability"] = {"bond_stability_mode": "RIGID"}
+    payload["constraints"] = [{
+        "stable_id": str(uuid.uuid5(uuid.NAMESPACE_DNS, "ka-rigid-authored-rest-edge")),
+        "constraint_type": "BREAKABLE_FIXED",
+        "body_a": base["stable_id"],
+        "body_b": top["stable_id"],
+        "body_a_name": base["name"],
+        "body_b_name": top["name"],
+        "anchor": [0.0, 0.0, 0.55],
+        "normal": [0.0, 0.0, 1.0],
+        "area": 1.0,
+        "break_force": 1.0e12,
+        "break_torque": 1.0e12,
+        "damage_accumulation": 0.0,
+        "damage": 0.0,
+        "enabled": True,
+    }]
+    result = backend.bake(payload)
+    first = result["frames"]["1"]
+    maximum_displacement = 0.0
+    maximum_rotation_delta = 0.0
+    for snapshot in result["frames"].values():
+        for name in (base["name"], top["name"]):
+            maximum_displacement = max(
+                maximum_displacement,
+                math.dist(first[name]["location"], snapshot[name]["location"]),
+            )
+            dot = abs(sum(
+                float(first[name]["rotation"][index]) * float(snapshot[name]["rotation"][index])
+                for index in range(4)
+            ))
+            maximum_rotation_delta = max(
+                maximum_rotation_delta,
+                2.0 * math.acos(max(-1.0, min(1.0, dot))),
+            )
+    totals = result.get("diagnostic_totals", {})
+    passed = (
+        maximum_displacement <= 1.0e-7
+        and maximum_rotation_delta <= 1.0e-7
+        and int(totals.get("bond_supported_cluster_deactivations", 0)) >= 1
+        and int(result.get("final_state", {}).get("sleeping_bodies", 0)) == 2
+        and int(totals.get("bond_cluster_count", 0)) == 1
+    )
+    return {
+        "name": "Rigid authored ground rest",
+        "passed": bool(passed),
+        "metrics": {
+            "maximum_displacement": maximum_displacement,
+            "maximum_rotation_delta": maximum_rotation_delta,
+            "supported_cluster_deactivations": totals.get("bond_supported_cluster_deactivations"),
+            "sleeping_bodies": result.get("final_state", {}).get("sleeping_bodies"),
+            "cluster_count": totals.get("bond_cluster_count"),
+        },
+    }
+
+
+def _run_rigid_authored_ground_wake(backend: JoltBackend) -> Dict[str, Any]:
+    """An initially sleeping rigid island must wake when an active body hits it."""
+    ground = _body(
+        "WakeGround", "STATIC", "PLANE", (0.0, 0.0, 0.0),
+        half_extents=(10.0, 10.0, 1.0e-5), friction=0.7,
+    )
+    ground["managed_ground"] = True
+    first = _body(
+        "WakeA", "DYNAMIC", "CONVEX_HULL", (0.0, 0.0, 0.0),
+        half_extents=(0.20, 0.20, 0.12), mass=5.0, friction=0.7,
+    )
+    second = _body(
+        "WakeB", "DYNAMIC", "CONVEX_HULL", (0.0, 0.0, 0.0),
+        half_extents=(0.20, 0.20, 0.12), mass=5.0, friction=0.7,
+    )
+    first["stable_id"] = str(uuid.uuid5(uuid.NAMESPACE_DNS, "ka-rigid-ground-wake-a"))
+    second["stable_id"] = str(uuid.uuid5(uuid.NAMESPACE_DNS, "ka-rigid-ground-wake-b"))
+    first["shape_center"] = [-0.22, 0.0, 0.12]
+    second["shape_center"] = [0.22, 0.0, 0.12]
+    first["convex_vertices"] = [
+        [-0.22 + x, y, 0.12 + z]
+        for x in (-0.20, 0.20) for y in (-0.20, 0.20) for z in (-0.12, 0.12)
+    ]
+    second["convex_vertices"] = [
+        [0.22 + x, y, 0.12 + z]
+        for x in (-0.20, 0.20) for y in (-0.20, 0.20) for z in (-0.12, 0.12)
+    ]
+    projectile = _body(
+        "WakeProjectile", "DYNAMIC", "SPHERE", (0.0, 0.0, 1.2),
+        radius=0.10, mass=2.0, friction=0.3,
+        velocity=(0.0, 0.0, -6.0), ccd=True,
+    )
+    projectile["stable_id"] = str(uuid.uuid5(uuid.NAMESPACE_DNS, "ka-rigid-ground-wake-projectile"))
+    payload = _payload(
+        "rigid-authored-ground-wake", [ground, first, second, projectile],
+        frames=80, gravity=(0.0, 0.0, -9.81), substeps=8,
+    )
+    payload["early_sleep_termination"] = False
+    payload["stability"] = {"bond_stability_mode": "RIGID"}
+    payload["constraints"] = [{
+        "stable_id": str(uuid.uuid5(uuid.NAMESPACE_DNS, "ka-rigid-ground-wake-edge")),
+        "constraint_type": "BREAKABLE_FIXED",
+        "body_a": first["stable_id"],
+        "body_b": second["stable_id"],
+        "body_a_name": first["name"],
+        "body_b_name": second["name"],
+        "anchor": [0.0, 0.0, 0.12],
+        "normal": [1.0, 0.0, 0.0],
+        "area": 1.0,
+        "break_force": 1.0e12,
+        "break_torque": 1.0e12,
+        "damage_accumulation": 0.0,
+        "damage": 0.0,
+        "enabled": True,
+    }]
+    result = backend.bake(payload)
+    frame_one = result["frames"]["1"][first["name"]]
+    frame_five = result["frames"]["5"][first["name"]]
+    frame_forty = result["frames"]["40"][first["name"]]
+    before_impact = math.dist(frame_one["location"], frame_five["location"])
+    after_impact = math.dist(frame_one["location"], frame_forty["location"])
+    totals = result.get("diagnostic_totals", {})
+    passed = (
+        before_impact <= 1.0e-7
+        and after_impact >= 1.0e-3
+        and int(totals.get("bond_supported_cluster_deactivations", 0)) >= 1
+        and int(totals.get("contact_events", 0)) > 0
+        and int(totals.get("bond_cluster_count", 0)) == 1
+    )
+    return {
+        "name": "Rigid authored ground wake",
+        "passed": bool(passed),
+        "metrics": {
+            "before_impact_displacement": before_impact,
+            "after_impact_displacement": after_impact,
+            "supported_cluster_deactivations": totals.get("bond_supported_cluster_deactivations"),
+            "contact_events": totals.get("contact_events"),
+            "cluster_count": totals.get("bond_cluster_count"),
+        },
+    }
 
 def _run_ccd(backend: JoltBackend) -> Dict[str, Any]:
     bodies = [
@@ -296,11 +926,11 @@ def _run_compound_convex_cluster(backend: JoltBackend) -> Dict[str, Any]:
         0.16 <= z <= 0.38
         and abs(x) < 0.35
         and sleeping == 1
-        and int(totals.get("native_body_count", 0)) == 3
-        and int(totals.get("compound_constraint_count", 0)) == 1
+        and int(totals.get("native_body_count", 0)) == 2
+        and int(totals.get("compound_constraint_count", 0)) == 0
     )
     return {
-        "name": "Compound Convex fixed cluster",
+        "name": "Compound Convex single-body fallback",
         "passed": passed,
         "metrics": {
             "final_location": final["location"],
@@ -524,6 +1154,33 @@ def _run_binary_cache_roundtrip(backend: JoltBackend) -> Dict[str, Any]:
     }
 
 
+def _run_initial_frame_integrity(backend: JoltBackend) -> Dict[str, Any]:
+    expected_location = (1.25, -0.75, 2.5)
+    payload = _payload("initial-frame-integrity", [
+        _body("Ground", "STATIC", "PLANE", (0.0, 0.0, 0.0), half_extents=(10.0, 10.0, 1.0e-5)),
+        _body("InitialBody", "DYNAMIC", "BOX", expected_location, half_extents=(0.2, 0.3, 0.4)),
+    ], frames=4, gravity=(0.0, 0.0, 0.0), substeps=2)
+    payload["store_python_frames"] = False
+    payload["diagnostics"] = {"enabled": False, "contacts": False}
+    result = backend.bake(payload)
+    decoded = decode_direct_frame_block(result.get("_binary_frame_block", {}))
+    first = decoded.get("1", {}).get("InitialBody", {})
+    location = tuple(float(value) for value in first.get("location", ()))
+    rotation = tuple(float(value) for value in first.get("rotation", ()))
+    max_error = max((abs(location[index] - expected_location[index]) for index in range(3)), default=float("inf"))
+    passed = max_error <= 1.0e-6 and rotation == (1.0, 0.0, 0.0, 0.0)
+    return {
+        "name": "Exact initial cache frame",
+        "passed": passed,
+        "metrics": {
+            "expected_location": list(expected_location),
+            "cached_location": list(location),
+            "cached_rotation": list(rotation),
+            "max_error": max_error,
+        },
+    }
+
+
 def _run_production_binary_only(backend: JoltBackend) -> Dict[str, Any]:
     payload = _payload("production-binary", [
         _body("Ground", "STATIC", "PLANE", (0.0, 0.0, 0.0), half_extents=(10.0, 10.0, 1.0e-5)),
@@ -716,11 +1373,12 @@ def run_regression_suite(*, determinism_tolerance: float = 1.0e-6) -> Dict[str, 
     backend = JoltBackend()
     tests = []
     for runner in (
-        _run_coacd_decomposition, _run_drop, _run_restitution, _run_stack, _run_friction, _run_ccd,
+        _run_simulation_scene_roundtrip, _run_simulation_scene_runtime_fallback, _run_simulation_scene_identity,
+        _run_coacd_decomposition, _run_drop, _run_restitution, _run_stack, _run_friction, _run_fracture_antistick_contact, _run_rigid_bond_island, _run_rigid_bond_collision_filter, _run_rigid_bond_island_sleep, _run_rigid_hull_fallback_ground_contact, _run_rigid_authored_ground_rest, _run_rigid_authored_ground_wake, _run_ccd,
         _run_managed_ground_guard, _run_compound, _run_compound_convex_cluster,
         _run_dense_fracture_pile, _run_confirmed_hybrid_sleep,
         _run_high_detail_convex_hull, _run_irregular_mass_ratio_pile, _run_contact_buffer,
-        _run_binary_cache_roundtrip, _run_production_binary_only, _run_independent_diagnostics,
+        _run_binary_cache_roundtrip, _run_initial_frame_integrity, _run_production_binary_only, _run_independent_diagnostics,
         _run_diagnostic_log_filtering, _run_thread_heuristic,
     ):
         test_started = time.perf_counter()
@@ -740,7 +1398,7 @@ def run_regression_suite(*, determinism_tolerance: float = 1.0e-6) -> Dict[str, 
 
     passed = sum(bool(item.get("passed")) for item in tests)
     return {
-        "suite_version": 13,
+        "suite_version": 24,
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "passed": passed,
         "failed": len(tests) - passed,
