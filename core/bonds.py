@@ -28,6 +28,7 @@ class _GeometryRecord:
     obj: Any
     stable_id: str
     name: str
+    body_type: str
     vertices: List[Vector]
     samples: List[Vector]
     tree: KDTree
@@ -122,6 +123,7 @@ def _geometry_record(obj: Any, stable_id: str, depsgraph: Any) -> _GeometryRecor
         obj=obj,
         stable_id=str(stable_id),
         name=str(obj.name_full),
+        body_type=str(getattr(obj.ka_rigid_body, "body_type", "DYNAMIC")).upper(),
         vertices=vertices,
         samples=_sample_vertices(vertices),
         tree=tree,
@@ -223,7 +225,7 @@ def generate_proximity_bonds(
 
     Candidate pairs are culled with AABBs. The final connection test uses
     nearest world-space mesh vertices in both directions, which is particularly
-    reliable for complementary KA Fracture surfaces.
+    reliable for complementary fractured surfaces.
     """
     candidates = [
         obj for obj in objects
@@ -250,6 +252,9 @@ def generate_proximity_bonds(
     tested_pairs = 0
     candidate_pairs = 0
     rejected_point_or_edge_contacts = 0
+    static_static_pairs_skipped = 0
+    dynamic_dynamic_bonds = 0
+    dynamic_static_bonds = 0
     for first_index, first in enumerate(records):
         for second in records[first_index + 1:]:
             if float(second.minimum.x) > float(first.maximum.x) + distance_limit:
@@ -258,19 +263,30 @@ def generate_proximity_bonds(
             if _aabb_distance(first, second) > distance_limit:
                 continue
             candidate_pairs += 1
+            first_dynamic = first.body_type == "DYNAMIC"
+            second_dynamic = second.body_type == "DYNAMIC"
+            if not first_dynamic and not second_dynamic:
+                static_static_pairs_skipped += 1
+                continue
             distance, point_a, point_b, close_count, support_area = _nearest_points(
                 first, second, distance_limit
             )
             if distance > distance_limit:
                 continue
-            minimum_support_area = max(1.0e-12, distance_limit * distance_limit * 0.01)
-            if close_count < 3 or support_area < minimum_support_area:
-                rejected_point_or_edge_contacts += 1
-                continue
             direction = second.center - first.center
             if direction.length_squared <= 1.0e-16:
                 direction = point_b - point_a
             normal = direction.normalized() if direction.length_squared > 1.0e-16 else Vector((0.0, 0.0, 1.0))
+            estimated_area = _estimated_contact_area(first, second, normal)
+            minimum_support_area = max(1.0e-12, distance_limit * distance_limit * 0.01)
+            mixed_dynamic_static = first_dynamic != second_dynamic
+            # Explicit/static anchors frequently touch a plane or a simple support
+            # along only one or two sampled vertices. Accept that mixed pair when
+            # the overlapping projected AABBs still provide a finite support area.
+            if close_count < 3 or support_area < minimum_support_area:
+                if not mixed_dynamic_static or estimated_area < minimum_support_area:
+                    rejected_point_or_edge_contacts += 1
+                    continue
             anchor = (point_a + point_b) * 0.5
             body_a, body_b = sorted((first.stable_id, second.stable_id))
             stable_id = str(uuid.uuid5(_BOND_NAMESPACE, f"{body_a}:{body_b}"))
@@ -283,9 +299,11 @@ def generate_proximity_bonds(
                 "body_b": second.stable_id,
                 "body_a_name": first.name,
                 "body_b_name": second.name,
+                "body_a_type": first.body_type,
+                "body_b_type": second.body_type,
                 "anchor": [float(value) for value in anchor],
                 "normal": [float(value) for value in normal],
-                "area": max(support_area, _estimated_contact_area(first, second, normal)),
+                "area": max(support_area, estimated_area),
                 "rest_distance": float(distance),
                 "break_force": max(0.0, float(break_force)),
                 "break_torque": max(0.0, float(break_torque)),
@@ -295,6 +313,10 @@ def generate_proximity_bonds(
                 "enabled": True,
                 "source": "PROXIMITY",
             })
+            if mixed_dynamic_static:
+                dynamic_static_bonds += 1
+            else:
+                dynamic_dynamic_bonds += 1
 
     bonds.sort(key=lambda item: str(item["stable_id"]))
     return bonds, {
@@ -303,6 +325,9 @@ def generate_proximity_bonds(
         "tested_pairs": tested_pairs,
         "candidate_pairs": candidate_pairs,
         "rejected_point_or_edge_contacts": rejected_point_or_edge_contacts,
+        "static_static_pairs_skipped": static_static_pairs_skipped,
+        "dynamic_dynamic_bonds": dynamic_dynamic_bonds,
+        "dynamic_static_bonds": dynamic_static_bonds,
         "bond_count": len(bonds),
         "maximum_distance": distance_limit,
     }

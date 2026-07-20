@@ -7,19 +7,27 @@ Diese README ist das gemeinsame Entwicklungs- und Architektur-Dokument der gesam
 
 > **Wichtige Abgrenzung:** Die einzelnen Add-ons werden zunächst unabhängig entwickelt, installiert und getestet. Das abschließende Sammel-Add-on koordiniert sie zu einem Gesamtworkflow. Es soll die Quellcodes nicht unkontrolliert zu einem Monolithen verschmelzen. Eine spätere gemeinsame Suite-Auslieferung kann alle Module bündeln, intern bleiben die Verantwortlichkeiten und Schnittstellen jedoch getrennt.
 
-> **Aktueller Implementierungsstand:** KA Rigid Dynamics 0.7.6 enthält `SimulationScene v1`, persistente Body-/Collider-IDs, Jolt/Culverin für Rigid Bodies, eine native-freie Windows-Compound-Zerlegung sowie absturzisoliertes CoACD auf anderen Systemen und einen binären Transform-Cache. Ein optionaler ABI-v2-Bridge für Jolt 5.6.0 erzeugt echte Compound-Shapes; ohne kompilierte Bridge bleibt Culverin automatisch als kompatibler Fallback aktiv. PhysX, Blast, PBD-Partikel, NVIDIA Flow, Rauch und Feuer sind noch nicht implementiert. KA Fracture wird als eigenständiges Add-on entwickelt. KA Simulation Core, KA Particles, KA Volumes und das koordinierende Suite-Add-on sind geplante beziehungsweise aufzubauende Module.
+> **Aktueller Implementierungsstand:** KA Rigid Dynamics 0.7.16 enthält `SimulationScene v1`, persistente Body-/Collider-/Constraint-IDs, Jolt/Culverin für Rigid Bodies, Rope-/Rod-Distance-Constraints, einen abgesicherten vollständigen Convex-Hull-Fallback unter Windows sowie absturzisoliertes CoACD auf anderen Systemen und einen binären Transform-Cache. Ein optionaler ABI-v2-Bridge für Jolt 5.6.0 erzeugt echte Compound-Shapes; bei externen Constraints oder ohne kompilierte Bridge bleibt Culverin automatisch als kompatibler Fallback aktiv. PhysX, Blast, PBD-Partikel, NVIDIA Flow, Rauch und Feuer sind noch nicht implementiert. Eine direkte KA-Fracture-Erkennung oder Importintegration ist nicht enthalten; Fracture-Geometrie wird wie jedes andere Mesh konfiguriert. KA Fracture wird als eigenständiges Add-on entwickelt. KA Simulation Core, KA Particles, KA Volumes und das koordinierende Suite-Add-on sind geplante beziehungsweise aufzubauende Module.
 
 In jedem Einzel-Add-on bleiben `ARCHITECTURE.md` und `CHANGELOG.md` modulspezifisch. Diese gemeinsame `README.md` beschreibt dagegen das Gesamtsystem und soll möglichst identisch gehalten werden.
 
-### Implementiert in KA Rigid Dynamics 0.7.6
+### Implementiert in KA Rigid Dynamics 0.7.16
+
+- Rope-Distance-Constraints für frei schwingende Abrissbirnen und Seilaufhängungen; Rod-Modus für eine starre masselose Verbindung.
+- Rope-Constraints bleiben bei Bond-Brüchen stabil: unabhängige Dynamic Bodies behalten ihre nativen Handles, betroffene Constraints werden nach Fracture-Cluster-Umbauten über persistente IDs neu gebunden.
+- `Anchor Rope at Cursor` erzeugt einen kleinen nicht kollidierenden Static Anchor am 3D-Cursor und verbindet ihn mit dem aktiven Dynamic Body.
+- Automatische Seillänge aus der aktuellen Distanz oder manuell gespeicherte feste Länge.
+
+- Rigid Dynamic-Static anchors filter contact between the already bonded actor pair, preserving the exact authored pose at simulation start while restoring collision when the anchor breaks.
+- Mass conditioning is applied per authored bonded target component, and bond damage uses mass-aware pre-solver contact momentum so heavy independent projectiles can permanently release overloaded fragments instead of producing a visual snap-back.
 
 - `SimulationScene v1` als solverneutraler Szenenvertrag und Quelle des Jolt-Payloads,
 - persistente UUIDs für Szene und Bodies sowie deterministische Collider-/Child-IDs,
 - optionaler Jolt-5.6-ABI-v2-Bridge mit einem echten `StaticCompoundShape` pro Compound-Convex-Body,
 - automatische Rückfallebene auf Culverin 0.13.2, falls keine kompilierte Bridge verfügbar ist,
 - CMake- und Buildskripte für Windows x64 und Linux x64,
-- 31 Regressionstests für den ausgelieferten Culverin-Pfad und den neutralen Datenvertrag, einschließlich starrer Compound-Bond-Inseln, exakter Boden-Ruhepose und automatischem Aufwecken durch Einschläge.
-- konservative Innenraum-Compound-Proxys unter Windows mit automatischem Erstkontakt-Überlappungswächter,
+- 39 Regressionstests für den ausgelieferten Culverin-Pfad und den neutralen Datenvertrag, einschließlich starrer Compound-Bond-Inseln, exakter Boden-Ruhepose, Static-Anchor-Ruhepose und automatischem Aufwecken durch Einschläge.
+- vollständige äußere Convex-Hull-Fallbacks im gebündelten Culverin-Pfad; keine unterfüllten Innenraum-Proxys für dynamischen Kontakt,
 - exakte Speicherung der ursprünglichen Blender-Transformationen in Cache-Frame 1,
 - reduzierte Standardreibung für erkannte Bruchstücke und 1-mm-Penetration-Slop gegen seitliches Niedriggeschwindigkeits-Kleben.
 - persistenter solverneutraler Bond-Graph für beliebige aktivierte Mesh-Bodies,
@@ -33,7 +41,7 @@ In jedem Einzel-Add-on bleiben `ARCHITECTURE.md` und `CHANGELOG.md` modulspezifi
 
 Die Quell- und Buildintegration des nativen Bridge ist enthalten. Eine vorkompilierte Bridge-Binärdatei ist nicht Bestandteil dieses Pakets; bis sie separat gebaut und installiert wurde, arbeitet das Add-on mit Culverin und dessen Single-Body-Compound-Fallback.
 
-Breakable Bonds verwenden in 0.7.6 den Culverin-Pfad, weil ABI-v2 noch keine externen Constraints bereitstellt. Die Bruchlast wird aus den Kontaktimpulsen pro Substep geschätzt; echte Jolt-Constraint-Reaktionsimpulse bleiben eine spätere ABI-Erweiterung.
+Breakable Bonds verwenden in 0.7.7 den Culverin-Pfad, weil ABI-v2 noch keine externen Constraints bereitstellt. Die Bruchlast wird aus den Kontaktimpulsen pro Substep geschätzt; echte Jolt-Constraint-Reaktionsimpulse bleiben eine spätere ABI-Erweiterung.
 Im Modus `Rigid` besitzt eine intakte Bond-Insel nur einen nativen Actor und daher keine internen Fragmentkontakte. Nach einer topologischen Trennung des Bond-Graphen werden neue Actors beziehungsweise Einzelkörper erzeugt, die wieder normal miteinander kollidieren.
 Der Standardmodus `Rigid` hält jede noch zusammenhängende Bond-Insel geometrisch starr. `Flexible` lässt zum Vergleich ausschließlich das native Fixed-Constraint-Netz arbeiten.
 
@@ -265,12 +273,12 @@ Bake-Steuerung + Cache + Playback + Diagnose
 |---|---|---|
 | KA Simulation Core | `SimulationScene v1` in Rigid Dynamics implementiert; gemeinsames Paket geplant | gemeinsame Datenverträge und Cache-Schemata |
 | KA Fracture | eigenständige aktive Entwicklung | Geometrie, Fragmente und Destruction Asset |
-| KA Rigid Dynamics | Version 0.7.6 vorhanden | Jolt-Rigid-Bodies, SimulationScene und Compound Convex |
+| KA Rigid Dynamics | Version 0.7.14 vorhanden | Jolt-Rigid-Bodies, SimulationScene, Distance Constraints und Compound Convex |
 | KA Particles | geplant | Splitter, Granulat und grober Staub |
 | KA Volumes | geplant | feiner Staub, Rauch und Feuer |
 | KA Destruction Suite | Abschluss-/Integrationsphase geplant | zentraler Workflow und gemeinsame UI |
 
-### In KA Rigid Dynamics 0.7.6 bereits vorhanden
+### In KA Rigid Dynamics 0.7.14 bereits vorhanden
 
 - Native Jolt-Rigid-Body-Simulation über Culverin 0.13.2.
 - Dynamische Convex-Hull-Collider.
@@ -384,9 +392,10 @@ Nachteile:
 
 Mehrere konvexe Teilkörper bilden eine konkave Form näherungsweise nach. Dies ist die bevorzugte präzise Kollisionsform für dynamische Bruchstücke.
 
-KA Rigid Dynamics 0.7.5 verwendet CoACD zur Zerlegung. Mit der optionalen Jolt-5.6-ABI-v2-Bridge werden die Teil-Hulls als ein nativer `StaticCompoundShape` und damit als genau ein Jolt-Body simuliert. Ohne kompilierte Bridge verwendet der gebündelte Culverin-Pfad einen einzigen stabilen Compound-Body aus konservativen, innenliegenden Box-Teilformen; es entstehen keine internen Fixed-Constraints.
-Single-Hull-Fallbacks innerhalb einer starren Bond-Insel werden in 0.7.5 durch innenliegende Kugel-Primitive angenähert. Dadurch können veraltete oder größere Source-Bounds nicht mehr unter den Boden ragen und die komplette Insel beim ersten Simulationsschritt anheben.
-Seit 0.7.6 starten geschwindigkeitslose starre Bond-Inseln, die bereits auf der verwalteten Bodenebene stehen, direkt schlafend in der unveränderten Autorenpose. Ein externer Einschlag weckt den Compound-Actor automatisch.
+KA Rigid Dynamics 0.7.7 verwendet CoACD zur Zerlegung. Mit der optionalen Jolt-5.6-ABI-v2-Bridge werden die Teil-Hulls als ein nativer `StaticCompoundShape` und damit als genau ein Jolt-Body simuliert. Ohne kompilierte Bridge verwendet der gebündelte Culverin-Pfad den vollständigen fitted Convex Hull als sicheren Außenflächen-Fallback. Er bildet Konkavitäten gröber ab, verhindert aber, dass große sichtbare Meshbereiche außerhalb eines stark unterfüllten Innenraum-Colliders liegen.
+Starre Bond-Inseln werden im Culverin-Pfad als ein gemeinsamer äußerer Convex Hull aus den Support-Punkten ihrer Fragment-Collider erzeugt. Die früheren inneren Box- und Kugel-Clouds werden nicht mehr für Produktionskontakte verwendet.
+Seit 0.7.6 starten geschwindigkeitslose starre Bond-Inseln, die bereits auf der verwalteten Bodenebene stehen, direkt schlafend in der unveränderten Autorenpose. Version 0.7.7 hält angefordertes CCD unabhängig von der Startgeschwindigkeit aktiv und berücksichtigt bei adaptiven Substeps auch schnelle Rotation.
+Version 0.7.12 deaktiviert im nativen Jolt-Bridge den abgerundeten Convex-Radius. Im Culverin-Fallback wird ausschließlich die ausgegebene Blender-Transformation gegen die verwaltete horizontale Bodenebene kompensiert, damit scharfe Render-Hull-Spitzen nicht sichtbar unter dem Boden liegen.
 
 Empfohlene Qualitätsstufen:
 
@@ -1302,7 +1311,7 @@ Jedes Add-on ergänzt zusätzlich:
 
 Beim Kopieren dieser README darf nicht der Eindruck entstehen, alle beschriebenen Funktionen seien bereits im jeweiligen Modul vorhanden. Maßgeblich ist immer die Statusübersicht sowie die modulspezifische Dokumentation.
 
-### Aktuelles Paket: KA Rigid Dynamics 0.7.6
+### Aktuelles Paket: KA Rigid Dynamics 0.7.14
 
 Für die derzeitige Rigid-Dynamics-Version gilt weiterhin:
 
@@ -1314,3 +1323,14 @@ Für die derzeitige Rigid-Dynamics-Version gilt weiterhin:
 
 Aktuelle Rigid-Body-Basis: **Jolt + CoACD + binärer Cache**.  
 Geplante Gesamtbasis: **modulare KA-Add-ons + gemeinsamer Core + PhysX/Blast + Jolt-Fallback + PBD-Partikel + Flow/OpenVDB**.
+
+
+
+
+### Mass-aware impact fracture ab Version 0.7.13
+
+Bei vorhandenen Dynamic-Dynamic-Bonds wird die Stabilisierung extremer Massenverhältnisse pro zusammenhängendem Zielverbund berechnet. Eine unabhängige Kugel oder ein anderes Projektil behält dadurch seine eingestellte Masse. Für Bond-Schäden wird zusätzlich zur gemeldeten Kontaktimpulsgröße die relative Geschwindigkeit am Kontaktpunkt vor der Solver-Auflösung mit der reduzierten Kollisionsmasse ausgewertet. Überlastete interne und statische Bonds lösen sich dadurch dauerhaft; der neu aufgebaute Rigid-Verbund übernimmt die aktuelle Einschlagspose und Geschwindigkeit statt zur Ausgangslage zurückzukehren.
+
+### Static-Anchor-Ruheposition ab Version 0.7.12
+
+Ein intakter Rigid-Verbund mit Static Anchor filtert neben dem direkt gebondeten Static-Endpunkt auch statische Nachbar-Collider, die seine vollständige äußere Convex-Hülle bereits in der gebackenen Ausgangsposition überlappen. Dadurch bleibt Frame 2 deckungsgleich mit Frame 1. Nach dem letzten Anchor-Bruch werden die normalen Kollisionen beim Topologie-Neuaufbau wieder aktiviert.

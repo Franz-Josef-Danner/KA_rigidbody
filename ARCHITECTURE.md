@@ -1,4 +1,4 @@
-# Architektur 0.6.0
+# Architektur 0.7.16
 
 > Dieses Dokument beschreibt die implementierte Ist-Architektur. Die langfristige Destruction-, PhysX-, Blast-, Partikel-, Staub-, Rauch- und Feuerarchitektur ist vollständig in [`README.md`](README.md) dokumentiert.
 
@@ -91,7 +91,7 @@ Quaternionen werden durch einen Basiswechsel konvertiert und im Cache wieder in 
 
 Bei `Mass Source = Density` wird die Masse aus dem ausgewerteten geschlossenen Blender-Mesh berechnet. Diese Masse wird dem nativen Convex Hull übergeben. Jolt erzeugt daraus den zur Kollisionsform passenden Trägheitstensor.
 
-KA-Fracture-Objekte werden standardmäßig mit dichtebasierter Masse importiert, damit große und kleine Bruchstücke nicht dieselbe Trägheit besitzen.
+Alle Bodies werden unabhängig von ihrer Herkunft konfiguriert. Dynamische Meshes können wahlweise eine feste Masse oder eine dichtebasierte Masse verwenden.
 
 ## Sleeping
 
@@ -276,7 +276,7 @@ Cache-Frame 1 wird nicht aus Culverins anfangs noch leeren Transform-Puffern gel
 
 Die 0.6.4-Innenraum-Proxys verhindern anfängliche Collider-Explosionen, beseitigen aber nicht automatisch statische Reibungsverbände in einem dichten Fragmenthaufen. Der reale Testcache zeigte lang anhaltende Kontakte mit fast horizontalen Normalen und nur wenigen Millimetern pro Sekunde Relativbewegung. Solche Paare konnten als gemeinsame Jolt-Insel einschlafen und visuell wie verklebt wirken.
 
-Erkannte KA-Fracture-Bodies verwenden deshalb bei neuer Zuweisung ein eigenes Materialprofil mit 0,20 Reibung. Die Einstellung bleibt pro Body gespeichert und kann weiterhin individuell überschrieben werden. Zusätzlich beträgt der Standardwert für `mPenetrationSlop` nun 1 mm statt 5 mm. Die Migration verändert ausschließlich die früheren exakten Standardwerte, damit bewusst eingestellte Materialparameter unverändert bleiben.
+Es gibt keine namens- oder tagbasierte Materialerkennung. Reibung, Masse und Dichte werden ausschließlich pro Body eingestellt. Der Standardwert für `mPenetrationSlop` beträgt 1 mm statt 5 mm.
 
 
 
@@ -289,6 +289,16 @@ The authoring operator builds proximity bonds from evaluated world-space mesh ve
 In `Flexible` mode Culverin 0.13.2 creates a bounded native Jolt Fixed-constraint network. In `Rigid` mode every connected intact dynamic bond component is instead represented by one native compound actor, while the complete authored graph remains solver-neutral runtime state. Culverin does not expose constraint reaction lambdas, therefore both modes evaluate external contact impulse per solver substep. The impulse is converted to an estimated force using the substep duration, distributed across the intact bonds of the impacted logical fragment, projected against the bond orientation and converted to an estimated torque around the bond anchor. Exceeding either threshold marks the bond broken and emits a deterministic `BOND_BREAK` event. Optional damage accumulation integrates repeated subcritical loading above a fixed activation ratio.
 
 The ABI-v2 bridge currently has no external-constraint ABI. Bond scenes therefore select the bundled Culverin runtime even when ABI-v2 is installed. Exact reaction-force fracture remains a later ABI extension.
+
+## 0.7.7 Collision Coverage and Motion-Aware CCD
+
+The production collider path no longer treats any non-empty interior-box decomposition as a valid dynamic contact representation. Such under-approximations can be stable for the solver while allowing the visible fragment to extend deeply through a plane. Without the optional ABI-v2 convex-compound bridge, a decomposed body therefore falls back to its complete fitted convex hull. Intact rigid bond components similarly use one component-wide outer convex hull built from authored collider support points rather than an interior primitive cloud.
+
+This fallback deliberately prefers collision coverage over concavity accuracy. It can bridge cavities, but it cannot produce the severe visible underfill caused by proxies representing only a small fraction of source volume. True multi-hull concavity remains available through the compiled native bridge.
+
+Requested dynamic CCD bodies are now created with Jolt `LinearCast` regardless of their start-frame velocity. Jolt performs its own movement thresholding, which is essential for sleeping fracture pieces that are accelerated only after an impact. Adaptive substeps estimate both translational travel and angular surface travel and compare the result with the smallest relevant collider feature length.
+
+Collider cache schema `KACL8` invalidates earlier interior-proxy entries. Simulation and collider caches must both be rebuilt after migration.
 
 ## 0.7.6 Authored Ground Rest
 
@@ -337,3 +347,48 @@ Culverin 0.13.2 has a hard limit of 256 constraints per world. Dense fracture as
 Version 0.7.1 initially added a post-step rigid transform projection to suppress visible joint stretch. Version 0.7.3 removes that mechanism because solver/projection feedback could inject global drift into dense compound fracture assets. Native Fixed constraints now provide the mechanical cohesion, while `Rigid` adds coordinated whole-island settling.
 
 Bond anchors and normals are stored author-side in Blender world coordinates but converted at bake initialization into local frames for both endpoint bodies. Force alignment and torque levers use the current transformed anchor, not the original world point. Contact samples whose other body belongs to the same intact bond component are classified as internal and excluded from the external fracture-load estimate.
+
+## 0.7.8 Sharp Ground Contact
+
+Jolt convex hulls use a rounded convex radius by default. The optional native ABI bridge now disables that radius for authored fracture hulls. Culverin 0.13.2 does not expose the setting, so its fallback keeps the native simulation untouched and corrects only exported Blender transforms when sharp source-hull vertices penetrate KA's managed horizontal ground plane. Rigid bond-cluster members share one correction to preserve cohesion.
+
+
+
+## 0.7.11 Rigid Static-Anchor Contact Filtering
+
+A Rigid Dynamic-Dynamic island is represented by one complete outer convex hull. This coverage-safe hull can fill authored gaps and therefore overlap a Static support that is already attached through a Dynamic-Static Fixed anchor. Solving both the overlap contact and the Fixed constraint on the same actor pair produced an immediate depenetration and rotation between cache frames 1 and 2.
+
+Every anchored dynamic actor now receives a free collision-category bit. Masks are rebuilt from the original compatibility rules while excluding only intact dynamic-actor/static-endpoint pairs. The Static body continues to collide with unrelated bodies, and the dynamic island continues to collide with all non-anchor statics. Whenever an anchor breaks and the rigid topology is rebuilt, the filter is rebuilt as well; normal collision is restored for the released pair. If the 16-bit category space is exhausted, overflow actors retain normal collision and the limitation is reported in diagnostics rather than disabling unrelated contacts.
+
+## 0.7.9 Rigid Dynamic-Static Anchors
+
+Rigid cohesion continues to represent every intact Dynamic-Dynamic bond island as one native actor. Intact Dynamic-Static bonds are now recreated as native Fixed constraints after every island rebuild, so a rigid fracture cluster can be mechanically attached to a static support while retaining authored break force and torque. Explicit Selected Only generation may include the managed ground; global generation still excludes it to prevent accidental scene-wide anchoring.
+
+
+## 0.7.13 Component Mass Conditioning and Mass-Aware Bond Loads
+
+When a scene contains authored Dynamic-Dynamic bonds, solver-only mass conditioning is scoped to each connected dynamic bond component. Independent projectiles are separate components and keep their authored mass. Scenes without authored dynamic bonds retain the legacy global loose-pile conditioning path.
+
+For each bond-monitored contact substep, the backend captures actor position, linear velocity and angular velocity before Jolt resolves contact. Contact-point velocities are reconstructed for both participants, projected onto the contact normal and combined with reduced collision mass. Bond loading uses the larger of the raw native contact impulse and this pre-solver momentum impulse. This avoids mass-invariant fracture behavior when the Culverin contact record reports a bounded impulse.
+
+After a bond break, the Rigid graph is rebuilt from the current solver poses and velocities. Surviving components and Static anchors are recreated at the impact state, preventing released fragments from being reconstructed at their authored start pose.
+
+## 0.7.12 Anchored Neighbouring-Static Rest Filtering
+
+Pairwise filtering of only the authored Dynamic-Static endpoint is not sufficient when Culverin represents a multi-fragment rigid island by one complete outer convex hull. The outer hull can overlap a neighbouring Static fragment that is not directly bonded to the island, even though the original authored meshes merely meet along irregular fracture surfaces. Resolving that overlap on frame 2 rotates and translates the anchored island.
+
+During every rigid topology rebuild, the backend now computes world-space actor bounds from the authored collider points before simulation advances. For each dynamic actor with at least one intact Static anchor, any additional Static actor whose authored bounds overlap the rigid-island envelope is added to the temporary anchor collision exclusions. These support-neighbour exclusions share the same dedicated category bit as the authored anchor pair, require no additional filter bits, and remain active only while the actor has an intact Static anchor. The next rebuild after the last anchor breaks restores the original collision compatibility.
+
+## 0.7.14 Authored Rope and Rod Constraints
+
+Authored mechanical constraints are represented by dedicated Blender Empty objects with persistent constraint UUIDs. A Distance record references two persistent body UUIDs and stores either a unilateral Rope range (`min = 0`, `max = length`) or a fixed Rod range (`min = max = length`).
+
+Culverin 0.13.2 creates these joints after rigid bond-island rebuilding so a constrained fragment resolves to its final native actor. The active compatibility API binds native body centers. For a freely placeable suspension point, the add-on creates a tiny Static sphere at the 3D cursor with collision mask zero; the Dynamic body then swings around that exact anchor location.
+
+The native world limit remains 256 total constraints. Existing compound and bond constraints keep their established priority; authored Distance constraints use the remaining native capacity. ABI-v2 currently has no external-joint interface, so any scene containing authored constraints deliberately selects bundled Culverin.
+
+## 0.7.16 Constraint Lifecycle During Fracture Rebuilds
+
+Rigid fracture islands are rebuilt whenever a bond breaks. Dynamic bodies that are not endpoints of the authored bond graph are now excluded from this topology rebuild, so projectiles, wrecking balls and other independent actors retain their native generational handles.
+
+If a Distance constraint endpoint does belong to a rebuilt fracture island, the backend destroys the native Distance constraint before replacing any endpoint actor and recreates it immediately afterwards from the persistent body UUIDs. A non-empty UUID never falls back to an object name, preventing silent rebinding to another object after duplication or topology changes.

@@ -15,13 +15,10 @@ from .core.scene_io import (
     ADDON_VERSION,
     apply_snapshot,
     ground_objects,
-    is_ka_fracture_piece,
     repair_managed_ground,
     resolve_cache_directory,
 )
 from .core.stability_defaults import (
-    FRACTURE_CONTACT_FRICTION_DEFAULT,
-    LEGACY_BODY_FRICTION_DEFAULT,
     LEGACY_PENETRATION_SLOP_DEFAULT,
     PENETRATION_SLOP_DEFAULT,
     matches_legacy_default,
@@ -31,7 +28,7 @@ from .diagnostics import log_event, log_exception
 _CACHE_MEMORY: Dict[int, Tuple[str, float, Dict]] = {}
 _LAST_APPLIED_FRAME: Dict[int, int] = {}
 _BAKE_RUNNING = False
-_SETTINGS_VERSION = 706
+_SETTINGS_VERSION = 714
 _PENDING_HANDLER_STATUS: Dict[str, int] = {}
 
 
@@ -253,7 +250,6 @@ def migrate_scene_settings(scene: bpy.types.Scene) -> None:
         migration_detail += " Applied 0.5.0 explicit CoACD Compound Convex collider settings."
 
     if current < 603:
-        settings.fracture_hull_inset = 0.001
         settings.cache_status = "Updated to 0.6.3 safe Windows Compound Convex processing; clear proxy cache and rebake"
         migration_detail += " Applied 0.6.3 native-free Windows Compound Convex processing and invalid-triangle cleanup."
 
@@ -262,26 +258,15 @@ def migrate_scene_settings(scene: bpy.types.Scene) -> None:
         migration_detail += " Applied 0.6.4 conservative interior compounds, automatic initial-overlap fallback and exact frame-one caching."
 
     if current < 605:
-        adjusted_friction = []
-        target_friction = float(getattr(settings, "fracture_friction", FRACTURE_CONTACT_FRICTION_DEFAULT))
-        for obj in scene.objects:
-            body = getattr(obj, "ka_rigid_body", None)
-            if not body or not bool(getattr(body, "enabled", False)):
-                continue
-            if str(getattr(body, "body_type", "")) != "DYNAMIC" or not is_ka_fracture_piece(obj):
-                continue
-            if matches_legacy_default(getattr(body, "friction", LEGACY_BODY_FRICTION_DEFAULT), LEGACY_BODY_FRICTION_DEFAULT):
-                body.friction = target_friction
-                adjusted_friction.append(obj.name_full)
         slop_adjusted = matches_legacy_default(
             getattr(settings, "penetration_slop", LEGACY_PENETRATION_SLOP_DEFAULT),
             LEGACY_PENETRATION_SLOP_DEFAULT,
         )
         if slop_adjusted:
             settings.penetration_slop = PENETRATION_SLOP_DEFAULT
-        settings.cache_status = "Updated to 0.6.5 anti-stick fracture contacts; clear cache and rebake"
+        settings.cache_status = "Updated to 0.6.5 contact stability defaults; clear cache and rebake"
         migration_detail += (
-            f" Applied 0.6.5 lower-friction fracture contacts to {len(adjusted_friction)} untouched body setting(s)"
+            " Applied 0.6.5 contact stability defaults"
             + (" and reduced legacy penetration slop to 1 mm." if slop_adjusted else ".")
         )
 
@@ -337,6 +322,61 @@ def migrate_scene_settings(scene: bpy.types.Scene) -> None:
         migration_detail += (
             " Applied 0.7.6 exact authored-pose sleeping for zero-velocity rigid bond compounds "
             "already supported by managed ground; external impacts still wake them normally."
+        )
+
+    if current < 707:
+        settings.cache_status = "Updated to 0.7.7 collision coverage and CCD; clear cache and rebake"
+        migration_detail += (
+            " Applied 0.7.7 complete outer-hull fallbacks instead of underfilled interior proxies, "
+            "Jolt LinearCast for every requested dynamic body, and rotation-aware adaptive substeps."
+        )
+
+    if current < 708:
+        settings.cache_status = "Updated to 0.7.8 sharp ground contact; clear cache and rebake"
+        migration_detail += (
+            " Applied 0.7.8 zero-radius native convex hulls and managed-ground playback "
+            "compensation for Culverin's rounded convex-hull contact geometry."
+        )
+
+    if current < 709:
+        settings.cache_status = "Updated to 0.7.9 rigid static anchors; clear cache and rebake"
+        migration_detail += (
+            " Applied 0.7.9 native Dynamic-Static Fixed anchors for rigid bond islands, "
+            "explicit selected-ground bond authoring, and mixed-pair generation diagnostics."
+        )
+
+    if current < 710:
+        settings.cache_status = "Updated to 0.7.10 generic body workflow; clear caches and rebake"
+        migration_detail += (
+            " Applied 0.7.10 removal of automatic KA Fracture recognition, import defaults, "
+            "special hull inset and material overrides. Breakable Cohesion remains generic."
+        )
+
+    if current < 711:
+        settings.cache_status = "Updated to 0.7.11 stable static-anchor rest; clear cache and rebake"
+        migration_detail += (
+            " Applied 0.7.11 pairwise collision filtering between intact rigid islands "
+            "and their bonded Static endpoints, preventing frame-two depenetration offsets."
+        )
+
+    if current < 712:
+        settings.cache_status = "Updated to 0.7.12 stable neighbouring Static rest; clear cache and rebake"
+        migration_detail += (
+            " Applied 0.7.12 authored-pose filtering for initially overlapping Static neighbours "
+            "of intact rigid Static-anchor islands, preventing residual frame-two jumps."
+        )
+
+    if current < 713:
+        settings.cache_status = "Updated to 0.7.13 mass-aware fracture loads; clear cache and rebake"
+        migration_detail += (
+            " Applied 0.7.13 bond-component mass conditioning and pre-solver momentum-based "
+            "impact loads so independent heavy projectiles can permanently release overloaded islands."
+        )
+
+    if current < 714:
+        settings.cache_status = "Updated to 0.7.14 Rope constraints; clear cache and rebake"
+        migration_detail += (
+            " Applied 0.7.14 authored Rope/Rod Distance constraints and cursor-based Static anchors."
         )
 
     # Playback must not remain silently disabled after an add-on upgrade.

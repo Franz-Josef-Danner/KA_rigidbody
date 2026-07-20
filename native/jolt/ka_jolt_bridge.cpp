@@ -219,6 +219,11 @@ ShapeRefC create_convex(const KAPhysicsVec3 *vertices, uint32_t count) {
     points.reserve(count);
     for (uint32_t i = 0; i < count; ++i) points.push_back(vec3(vertices[i]));
     ConvexHullShapeSettings settings(points);
+    // Preserve the authored sharp fracture silhouette. Jolt otherwise shrinks
+    // the source hull and re-inflates it with the default convex radius, which
+    // makes sharp render vertices appear below a plane even while the rounded
+    // physical hull is resting correctly.
+    settings.mMaxConvexRadius = 0.0f;
     auto result = settings.Create();
     if (result.HasError()) { set_error(result.GetError()); return nullptr; }
     return result.Get();

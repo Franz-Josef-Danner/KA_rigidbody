@@ -16,6 +16,7 @@ from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional,
 SIMULATION_SCENE_SCHEMA = "ka.simulation_scene"
 SIMULATION_SCENE_VERSION = 1
 BODY_ID_PROPERTY = "ka_rigid_stable_id"
+CONSTRAINT_ID_PROPERTY = "ka_rigid_constraint_id"
 SCENE_ID_PROPERTY = "ka_rigid_scene_id"
 _ID_NAMESPACE = uuid.UUID("4f9e5b0a-7272-4ec4-96dc-46fb92d7fc7e")
 
@@ -79,6 +80,22 @@ def ensure_scene_body_ids(objects: Iterable[object]) -> Dict[int, str]:
     result: Dict[int, str] = {}
     for obj in ordered:
         result[id(obj)] = ensure_stable_id(obj, BODY_ID_PROPERTY, seen=seen)
+    return result
+
+
+def ensure_scene_constraint_ids(objects: Iterable[object]) -> Dict[int, str]:
+    """Assign unique persistent IDs to authored Blender constraint objects."""
+    ordered = sorted(
+        list(objects),
+        key=lambda obj: (
+            str(getattr(obj, "name_full", getattr(obj, "name", ""))).casefold(),
+            str(getattr(obj, "name_full", getattr(obj, "name", ""))),
+        ),
+    )
+    seen: set[str] = set()
+    result: Dict[int, str] = {}
+    for obj in ordered:
+        result[id(obj)] = ensure_stable_id(obj, CONSTRAINT_ID_PROPERTY, seen=seen)
     return result
 
 
@@ -189,6 +206,7 @@ def legacy_body_to_scene_body(body: Mapping[str, Any], material_id: str) -> Dict
             "render_source_vertex_count": int(body.get("render_source_vertex_count", 0)),
             "collision_proxy": body.get("collision_proxy"),
             "radius": float(body.get("radius", 0.5)),
+            "minimum_feature_length": float(body.get("minimum_feature_length", 0.0) or 0.0),
             "half_extents": list(body.get("half_extents", (0.5, 0.5, 0.5))),
             "stability_adjustments": list(body.get("stability_adjustments", []) or []),
         },
@@ -274,6 +292,7 @@ def scene_body_to_legacy(body: Mapping[str, Any], materials: Mapping[str, Mappin
         "shape_center": list(collider.get("local_transform", {}).get("translation", (0.0, 0.0, 0.0))),
         "half_extents": list(metadata.get("half_extents", geometry.get("half_extents", (0.5, 0.5, 0.5)))),
         "radius": float(metadata.get("radius", geometry.get("radius", 0.5))),
+        "minimum_feature_length": float(metadata.get("minimum_feature_length", 0.0) or 0.0),
         "mass": float(mass.get("mass", 1.0)),
         "raw_mass": float(mass.get("raw_mass", mass.get("mass", 1.0))),
         "mass_mode": str(mass.get("mode", "MASS")),
@@ -462,10 +481,18 @@ def validate_simulation_scene(scene: Mapping[str, Any]) -> None:
                 f"Constraint {constraint_id} references invalid bodies: {body_a!r}, {body_b!r}"
             )
         constraint_type = str(constraint.get("constraint_type", ""))
-        if constraint_type not in {"BREAKABLE_FIXED", "FIXED"}:
+        if constraint_type not in {"BREAKABLE_FIXED", "FIXED", "DISTANCE"}:
             raise SimulationSceneError(
                 f"Constraint {constraint_id} has unsupported type {constraint_type!r}"
             )
+        if constraint_type == "DISTANCE":
+            minimum = float(constraint.get("min_distance", 0.0))
+            maximum = float(constraint.get("max_distance", 0.0))
+            if minimum < 0.0 or maximum <= 0.0 or minimum > maximum:
+                raise SimulationSceneError(
+                    f"Distance constraint {constraint_id} has invalid limits "
+                    f"({minimum}, {maximum})"
+                )
         if float(constraint.get("break_force", 0.0)) < 0.0:
             raise SimulationSceneError(f"Constraint {constraint_id} break_force must be non-negative")
         if float(constraint.get("break_torque", 0.0)) < 0.0:

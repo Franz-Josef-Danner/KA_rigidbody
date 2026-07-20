@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 id = "ka_rigid_dynamics"
-version = "0.7.6"
+version = "0.7.16"
 name = "KA Rigid Dynamics"
 tagline = "Native Jolt rigid-body simulation and cache for Blender"
 maintainer = "KA"

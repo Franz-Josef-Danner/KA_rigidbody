@@ -22,7 +22,12 @@ from .core.cache import (
 )
 from .core.determinism import compare_frames, frames_digest
 from .core.regression import run_regression_suite, write_regression_report
-from .core.simulation_scene import BODY_ID_PROPERTY, apply_single_hull_fallback
+from .core.simulation_scene import (
+    BODY_ID_PROPERTY,
+    CONSTRAINT_ID_PROPERTY,
+    apply_single_hull_fallback,
+    ensure_stable_id,
+)
 from .core.scene_io import (
     apply_snapshot,
     build_scene_payload,
@@ -33,8 +38,6 @@ from .core.scene_io import (
     GROUND_OBJECT_TAG,
     ground_objects,
     is_ka_ground,
-    FRACTURE_TAGS,
-    fracture_candidates,
     resolve_cache_directory,
     restore_rest_transform,
     repair_managed_ground,
@@ -97,6 +100,64 @@ def _select_jolt_for_complex_scene(context, objects, *, source: str, cancel_if_u
     if cancel_if_unavailable:
         raise BackendError(message)
     return False
+
+
+def _create_rope_constraint_object(scene, body_a, body_b):
+    name = f"KA_Rope_{body_a.name}_{body_b.name}"
+    obj = bpy.data.objects.new(name, None)
+    scene.collection.objects.link(obj)
+    obj.empty_display_type = "SPHERE"
+    obj.empty_display_size = 0.15
+    obj.show_in_front = True
+    obj.location = body_a.matrix_world.translation
+    settings = obj.ka_rigid_constraint
+    settings.enabled = True
+    settings.constraint_mode = "ROPE"
+    settings.body_a = body_a
+    settings.body_b = body_b
+    settings.use_current_distance = True
+    settings.distance = max(
+        1.0e-5,
+        float((body_b.matrix_world.translation - body_a.matrix_world.translation).length),
+    )
+    # Operators run in a writable Blender context. Persist IDs here so the UI
+    # never needs to repair data merely to display a constraint count.
+    ensure_stable_id(body_a, BODY_ID_PROPERTY)
+    ensure_stable_id(body_b, BODY_ID_PROPERTY)
+    ensure_stable_id(obj, CONSTRAINT_ID_PROPERTY)
+    return obj
+
+
+def _create_static_anchor(scene, location):
+    radius = 0.03
+    vertices = [
+        (radius, 0.0, 0.0), (-radius, 0.0, 0.0),
+        (0.0, radius, 0.0), (0.0, -radius, 0.0),
+        (0.0, 0.0, radius), (0.0, 0.0, -radius),
+    ]
+    faces = [
+        (0, 2, 4), (2, 1, 4), (1, 3, 4), (3, 0, 4),
+        (2, 0, 5), (1, 2, 5), (3, 1, 5), (0, 3, 5),
+    ]
+    mesh = bpy.data.meshes.new("KA_Rope_Anchor_Mesh")
+    mesh.from_pydata(vertices, [], faces)
+    mesh.update()
+    obj = bpy.data.objects.new("KA_Rope_Anchor", mesh)
+    scene.collection.objects.link(obj)
+    obj.location = location
+    obj.display_type = "WIRE"
+    obj.show_in_front = True
+    obj.hide_render = True
+    settings = obj.ka_rigid_body
+    settings.enabled = True
+    settings.body_type = "STATIC"
+    settings.collision_shape = "SPHERE"
+    settings.collision_layer = 15
+    settings.collision_mask = 0
+    settings.friction = 0.0
+    settings.restitution = 0.0
+    store_rest_transform(obj, force=True)
+    return obj
 
 
 def _body_diagnostics(payload):
@@ -308,11 +369,8 @@ class KA_RIGID_OT_assign_selected(Operator):
             log_event(scene, "OPERATOR", "ASSIGN_SELECTED_CANCELLED", level="WARNING", reason="No supported object selected")
             self.report({"WARNING"}, "No supported object selected")
             return {"CANCELLED"}
-        fracture_objects = []
         assigned_objects = []
         protected_grounds = []
-        density = scene.ka_rigid_world.fracture_density
-        fracture_friction = scene.ka_rigid_world.fracture_friction
         for obj in objects:
             if bool(obj.get(GROUND_OBJECT_TAG, False)) or obj.name.startswith(GROUND_OBJECT_NAME):
                 changed = repair_managed_ground(obj, store_rest=True)
@@ -326,23 +384,10 @@ class KA_RIGID_OT_assign_selected(Operator):
             settings = obj.ka_rigid_body
             settings.enabled = True
             settings.body_type = self.body_type
-            is_fracture_piece = (
-                obj.name.startswith("KA_Fracture_Piece_")
-                or any(bool(obj.get(tag, False)) for tag in FRACTURE_TAGS)
-            )
-            if self.body_type == "DYNAMIC" and is_fracture_piece:
-                settings.collision_shape = "CONVEX_HULL"
-                settings.mass_mode = "DENSITY"
-                settings.density = density
-                settings.friction = fracture_friction
-                settings.use_ccd = True
-                fracture_objects.append(obj.name_full)
-            elif self.body_type == "STATIC" and settings.collision_shape == "CONVEX_HULL":
+            if self.body_type == "STATIC" and settings.collision_shape == "CONVEX_HULL":
                 settings.collision_shape = "MESH"
             store_rest_transform(obj, force=True)
             assigned_objects.append(obj.name_full)
-        if fracture_objects:
-            _select_jolt_for_complex_scene(context, objects, source="ASSIGN_SELECTED", cancel_if_unavailable=False)
         scene.ka_rigid_world.cache_status = "Scene changed; rebake required"
         log_event(
             scene,
@@ -352,9 +397,6 @@ class KA_RIGID_OT_assign_selected(Operator):
             count=len(assigned_objects),
             objects=assigned_objects,
             protected_grounds=protected_grounds,
-            fracture_defaults_applied=fracture_objects,
-            fracture_density=density if fracture_objects else None,
-            fracture_friction=fracture_friction if fracture_objects else None,
         )
         if protected_grounds and self.body_type == "DYNAMIC":
             self.report({"INFO"}, f"Assigned {len(assigned_objects)} bodies; protected {len(protected_grounds)} ground plane")
@@ -448,6 +490,141 @@ class KA_RIGID_OT_restore_rest_transform(Operator):
         return {"FINISHED"}
 
 
+class KA_RIGID_OT_create_rope_constraint(Operator):
+    bl_idname = "ka_rigid.create_rope_constraint"
+    bl_label = "Create Rope from Selected"
+    bl_description = "Connect two selected enabled KA bodies with a center-to-center Rope constraint"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        scene = context.scene
+        bodies = [
+            obj for obj in context.selected_objects
+            if hasattr(obj, "ka_rigid_body") and obj.ka_rigid_body.enabled
+        ]
+        if len(bodies) != 2:
+            self.report({"ERROR"}, "Select exactly two enabled KA bodies")
+            return {"CANCELLED"}
+
+        dynamic = [obj for obj in bodies if obj.ka_rigid_body.body_type == "DYNAMIC"]
+        if not dynamic:
+            self.report({"ERROR"}, "At least one selected body must be Dynamic")
+            return {"CANCELLED"}
+
+        if len(dynamic) == 1:
+            body_b = dynamic[0]
+            body_a = bodies[0] if bodies[1] == body_b else bodies[1]
+        else:
+            body_b = context.active_object if context.active_object in bodies else bodies[-1]
+            body_a = bodies[0] if bodies[1] == body_b else bodies[1]
+
+        store_rest_transform(body_a, force=True)
+        store_rest_transform(body_b, force=True)
+        constraint = _create_rope_constraint_object(scene, body_a, body_b)
+        for selected in tuple(context.selected_objects):
+            selected.select_set(False)
+        constraint.select_set(True)
+        context.view_layer.objects.active = constraint
+        scene.ka_rigid_world.cache_status = "Rope constraint created; rebake required"
+        log_event(
+            scene,
+            "CONSTRAINT",
+            "ROPE_CREATED",
+            constraint=constraint.name_full,
+            body_a=body_a.name_full,
+            body_b=body_b.name_full,
+            use_current_distance=True,
+        )
+        self.report({"INFO"}, f"Rope created: {body_a.name} → {body_b.name}")
+        return {"FINISHED"}
+
+
+class KA_RIGID_OT_create_rope_anchor(Operator):
+    bl_idname = "ka_rigid.create_rope_anchor"
+    bl_label = "Anchor Rope at Cursor"
+    bl_description = "Create a non-colliding Static anchor at the 3D cursor and connect it to the active Dynamic body"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        scene = context.scene
+        body = context.active_object
+        if (
+            body is None
+            or not hasattr(body, "ka_rigid_body")
+            or not body.ka_rigid_body.enabled
+            or body.ka_rigid_body.body_type != "DYNAMIC"
+        ):
+            self.report({"ERROR"}, "The active object must be an enabled Dynamic KA body")
+            return {"CANCELLED"}
+
+        anchor = _create_static_anchor(scene, scene.cursor.location.copy())
+        store_rest_transform(body, force=True)
+        constraint = _create_rope_constraint_object(scene, anchor, body)
+        for selected in tuple(context.selected_objects):
+            selected.select_set(False)
+        constraint.select_set(True)
+        context.view_layer.objects.active = constraint
+        scene.ka_rigid_world.cache_status = "Rope anchor created; rebake required"
+        log_event(
+            scene,
+            "CONSTRAINT",
+            "ROPE_ANCHOR_CREATED",
+            constraint=constraint.name_full,
+            anchor=anchor.name_full,
+            body=body.name_full,
+            location=list(anchor.location),
+        )
+        self.report({"INFO"}, "Static rope anchor created at the 3D cursor")
+        return {"FINISHED"}
+
+
+class KA_RIGID_OT_store_constraint_length(Operator):
+    bl_idname = "ka_rigid.store_constraint_length"
+    bl_label = "Store Current Length"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        obj = context.active_object
+        if obj is None or not hasattr(obj, "ka_rigid_constraint"):
+            return {"CANCELLED"}
+        settings = obj.ka_rigid_constraint
+        if not (settings.enabled or settings.body_a is not None or settings.body_b is not None):
+            self.report({"ERROR"}, "The active object is not a KA constraint")
+            return {"CANCELLED"}
+        if settings.body_a is None or settings.body_b is None:
+            self.report({"ERROR"}, "Assign both constraint bodies first")
+            return {"CANCELLED"}
+        settings.distance = max(
+            1.0e-5,
+            float((settings.body_b.matrix_world.translation - settings.body_a.matrix_world.translation).length),
+        )
+        settings.use_current_distance = False
+        context.scene.ka_rigid_world.cache_status = "Constraint length changed; rebake required"
+        self.report({"INFO"}, f"Stored length: {settings.distance:.4f} m")
+        return {"FINISHED"}
+
+
+class KA_RIGID_OT_delete_constraint(Operator):
+    bl_idname = "ka_rigid.delete_constraint"
+    bl_label = "Delete Constraint"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        obj = context.active_object
+        if obj is None or not hasattr(obj, "ka_rigid_constraint"):
+            return {"CANCELLED"}
+        settings = obj.ka_rigid_constraint
+        if not (settings.enabled or settings.body_a is not None or settings.body_b is not None):
+            self.report({"ERROR"}, "The active object is not a KA constraint")
+            return {"CANCELLED"}
+        name = obj.name_full
+        bpy.data.objects.remove(obj, do_unlink=True)
+        context.scene.ka_rigid_world.cache_status = "Constraint removed; rebake required"
+        log_event(context.scene, "CONSTRAINT", "DELETED", constraint=name)
+        self.report({"INFO"}, f"Deleted {name}")
+        return {"FINISHED"}
+
+
 class KA_RIGID_OT_sync_frame_range(Operator):
     bl_idname = "ka_rigid.sync_frame_range"
     bl_label = "Use Scene Frame Range"
@@ -506,39 +683,6 @@ class KA_RIGID_OT_fix_invalid_colliders(Operator):
         return {"FINISHED"}
 
 
-class KA_RIGID_OT_import_fracture(Operator):
-    bl_idname = "ka_rigid.import_fracture"
-    bl_label = "Import KA Fracture Pieces"
-    bl_options = {"REGISTER", "UNDO"}
-
-    selected_only: BoolProperty(name="Selected Only", default=False)
-
-    def execute(self, context):
-        scene = context.scene
-        objects = [obj for obj in context.selected_objects if obj.type == "MESH"] if self.selected_only else fracture_candidates(context)
-        if not objects:
-            log_event(scene, "FRACTURE", "IMPORT_CANCELLED", level="WARNING", selected_only=self.selected_only, reason="No fracture pieces found")
-            self.report({"WARNING"}, "No KA Fracture pieces or mesh objects found")
-            return {"CANCELLED"}
-        density = scene.ka_rigid_world.fracture_density
-        fracture_friction = scene.ka_rigid_world.fracture_friction
-        for obj in objects:
-            settings = obj.ka_rigid_body
-            settings.enabled = True
-            settings.body_type = "DYNAMIC"
-            settings.collision_shape = "CONVEX_HULL"
-            settings.mass_mode = "DENSITY"
-            settings.density = density
-            settings.friction = fracture_friction
-            settings.use_ccd = True
-            store_rest_transform(obj, force=True)
-        _select_jolt_for_complex_scene(context, objects, source="IMPORT_FRACTURE", cancel_if_unavailable=False)
-        scene.ka_rigid_world.cache_status = "Fracture pieces imported; bake required"
-        log_event(scene, "FRACTURE", "PIECES_IMPORTED", selected_only=self.selected_only, density=density, friction=fracture_friction, count=len(objects), objects=[obj.name_full for obj in objects])
-        self.report({"INFO"}, f"Imported {len(objects)} fracture pieces")
-        return {"FINISHED"}
-
-
 class KA_RIGID_OT_generate_bonds(Operator):
     bl_idname = "ka_rigid.generate_bonds"
     bl_label = "Generate Breakable Bonds"
@@ -556,7 +700,6 @@ class KA_RIGID_OT_generate_bonds(Operator):
                 if obj.type == "MESH"
                 and hasattr(obj, "ka_rigid_body")
                 and obj.ka_rigid_body.enabled
-                and not is_ka_ground(obj)
             ]
         else:
             objects = [
@@ -580,6 +723,8 @@ class KA_RIGID_OT_generate_bonds(Operator):
             self.report({"ERROR"}, f"Bond generation failed: {exc}")
             return {"CANCELLED"}
         generated_count = len(bonds)
+        dynamic_static_count = int(report.get("dynamic_static_bonds", 0))
+        dynamic_dynamic_count = int(report.get("dynamic_dynamic_bonds", 0))
         if self.selected_only:
             selected_ids = {str(obj.get(BODY_ID_PROPERTY, "")) for obj in objects}
             retained = [
@@ -609,7 +754,20 @@ class KA_RIGID_OT_generate_bonds(Operator):
             damage_accumulation=float(world.bond_damage_accumulation),
             **report,
         )
-        self.report({"INFO"}, f"Generated {generated_count} breakable bonds; {len(bonds)} stored")
+        selected_dynamic = sum(
+            str(obj.ka_rigid_body.body_type).upper() == "DYNAMIC" for obj in objects
+        )
+        selected_static = len(objects) - selected_dynamic
+        if self.selected_only and selected_dynamic and selected_static and dynamic_static_count == 0:
+            self.report(
+                {"WARNING"},
+                "No Dynamic-Static anchor bond was generated. Increase Connection Distance or ensure the selected surfaces touch.",
+            )
+        self.report(
+            {"INFO"},
+            f"Generated {generated_count} bonds ({dynamic_dynamic_count} Dynamic-Dynamic, "
+            f"{dynamic_static_count} Dynamic-Static); {len(bonds)} stored",
+        )
         return {"FINISHED"}
 
 
@@ -752,6 +910,7 @@ class KA_RIGID_OT_bake(Operator):
             mass_ratio=preflight.get("mass_ratio"),
             mass_ratio_before=preflight.get("mass_ratio_before"),
             mass_conditioning_floor=preflight.get("mass_conditioning_floor"),
+            constraint_count=preflight.get("constraint_count", 0),
             preflight_seconds=round(preflight_seconds, 6),
             collider_cache=geometry_cache_stats(),
         )
@@ -787,6 +946,22 @@ class KA_RIGID_OT_bake(Operator):
                     effective_backend="JOLT",
                     reason="Breakable bonds require Fixed constraints from the Jolt/Culverin backend.",
                 )
+            if int(preflight.get("constraint_count", 0)) > 0 and world.backend != "JOLT":
+                status = get_backend("JOLT").status(addon_preferences(context))
+                if not status.available:
+                    raise BackendError(f"Rope constraints require Jolt: {status.detail}")
+                previous_backend = world.backend
+                world.backend = "JOLT"
+                world.cache_status = "Jolt selected for Rope constraints; rebake required"
+                log_event(
+                    scene,
+                    "BACKEND",
+                    "AUTO_SELECTED",
+                    source="AUTHORED_CONSTRAINTS",
+                    previous_backend=previous_backend,
+                    effective_backend="JOLT",
+                    reason="Rope and Rod constraints require the Jolt/Culverin backend.",
+                )
         except BackendError as exc:
             world.cache_status = f"Backend error: {exc}"
             log_exception(scene, "BAKE", "BACKEND_SELECTION_FAILED", exc, requested_backend=requested_backend)
@@ -813,8 +988,6 @@ class KA_RIGID_OT_bake(Operator):
             enforce_mass_ratio_limit=bool(world.enforce_mass_ratio_limit),
             max_mass_ratio=world.max_mass_ratio,
             convex_hull_max_vertices=world.convex_hull_max_vertices,
-            fracture_hull_inset=world.fracture_hull_inset,
-            fracture_friction=world.fracture_friction,
             adaptive_hull_accuracy=bool(world.adaptive_hull_accuracy),
             hull_quality_preset=world.hull_quality_preset,
             hull_error_tolerance=world.hull_error_tolerance,
@@ -840,6 +1013,7 @@ class KA_RIGID_OT_bake(Operator):
                 else recommended_jolt_threads(int(preflight.get("dynamic_count", 0)))
             ),
             early_sleep_termination=bool(world.early_sleep_termination),
+            authored_constraint_count=int(preflight.get("constraint_count", 0)),
             detailed_contact_diagnostics=bool(world.detailed_contact_diagnostics),
             detailed_payload_diagnostics=bool(world.detailed_payload_diagnostics),
             collider_cache=geometry_cache_stats(),
@@ -1276,10 +1450,13 @@ CLASSES = (
     KA_RIGID_OT_remove_selected,
     KA_RIGID_OT_set_rest_transform,
     KA_RIGID_OT_restore_rest_transform,
+    KA_RIGID_OT_create_rope_constraint,
+    KA_RIGID_OT_create_rope_anchor,
+    KA_RIGID_OT_store_constraint_length,
+    KA_RIGID_OT_delete_constraint,
     KA_RIGID_OT_sync_frame_range,
     KA_RIGID_OT_validate,
     KA_RIGID_OT_fix_invalid_colliders,
-    KA_RIGID_OT_import_fracture,
     KA_RIGID_OT_generate_bonds,
     KA_RIGID_OT_clear_bonds,
     KA_RIGID_OT_create_ground,

@@ -3,10 +3,10 @@
 bl_info = {
     "name": "KA Rigid Dynamics",
     "author": "KA",
-    "version": (0, 7, 6),
+    "version": (0, 7, 16),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > KA Physics",
-    "description": "Native Jolt rigid-body simulation with cache playback and KA Fracture integration.",
+    "description": "Native Jolt rigid-body simulation with cache playback and breakable cohesion.",
     "category": "Physics",
 }
 

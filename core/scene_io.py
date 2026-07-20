@@ -29,6 +29,8 @@ except Exception:  # Blender builds normally bundle NumPy; keep a pure-Python fa
 
 from .cache import CACHE_VERSION, cache_file_path
 from .bonds import bonds_for_enabled_bodies
+from .constraints import constraints_for_enabled_bodies, validate_constraints
+from .mass_conditioning import condition_dynamic_mass_ratios
 from ..backends.culverin_loader import BUNDLED_CULVERIN_VERSION
 from .coacd_bridge import COACD_EXECUTION_MODE, COACD_VERSION, CoACDError, decompose as coacd_decompose
 from .simulation_scene import (
@@ -49,10 +51,10 @@ _GEOMETRY_CACHE_TOTAL_HITS = 0
 _GEOMETRY_CACHE_TOTAL_MISSES = 0
 _HULL_CACHE_TOTAL_HITS = 0
 _HULL_CACHE_TOTAL_MISSES = 0
-ADDON_VERSION = "0.7.6"
-SIGNATURE_SCHEMA = 24
+ADDON_VERSION = "0.7.14"
+SIGNATURE_SCHEMA = 33
 _SUPPORT_DIRECTION_CACHE: Dict[int, List[Vector]] = {}
-_PERSISTENT_HULL_CACHE_VERSION = 7
+_PERSISTENT_HULL_CACHE_VERSION = 8
 _PERSISTENT_HULL_CACHE_MAX_ENTRIES = 2048
 _PERSISTENT_HULL_CACHE: "OrderedDict[str, Dict]" = OrderedDict()
 _PERSISTENT_HULL_CACHE_PATH: Optional[str] = None
@@ -60,7 +62,7 @@ _PERSISTENT_HULL_CACHE_DIRTY = False
 _PERSISTENT_HULL_CACHE_LOAD_SECONDS = 0.0
 _PERSISTENT_HULL_CACHE_SAVE_SECONDS = 0.0
 _PERSISTENT_HULL_CACHE_FILE_SIZE = 0
-_HULL_CACHE_MAGIC = b"KACL064\0"
+_HULL_CACHE_MAGIC = b"KACL077\0"
 _HULL_CACHE_HEADER = struct.Struct("<8sIII")
 
 
@@ -70,7 +72,7 @@ def _vector_list(value: Iterable[float]) -> List[float]:
 
 
 def _persistent_hull_cache_file(directory: str) -> str:
-    return os.path.join(directory, "ka_rigid_colliders_v7.kahc")
+    return os.path.join(directory, "ka_rigid_colliders_v8.kahc")
 
 
 def _legacy_persistent_hull_cache_file(directory: str) -> str:
@@ -380,7 +382,7 @@ def geometry_cache_stats() -> Dict[str, object]:
         "persistent_hull_load_seconds": float(_PERSISTENT_HULL_CACHE_LOAD_SECONDS),
         "persistent_hull_save_seconds": float(_PERSISTENT_HULL_CACHE_SAVE_SECONDS),
         "persistent_hull_file_size": int(_PERSISTENT_HULL_CACHE_FILE_SIZE),
-        "persistent_hull_format": "KACL7-float64-zlib1",
+        "persistent_hull_format": "KACL8-float64-zlib1",
     }
 
 
@@ -396,20 +398,6 @@ def _geometry_cache_store(key: str, value: Dict) -> Dict:
     while len(_GEOMETRY_CACHE) > _GEOMETRY_CACHE_MAX_ENTRIES:
         _GEOMETRY_CACHE.popitem(last=False)
     return value
-
-FRACTURE_TAGS = (
-    "ka_fracture_final_piece",
-    "ka_fracture_break_piece",
-    "ka_fracture_prepared_piece",
-)
-
-
-def is_ka_fracture_piece(obj: bpy.types.Object) -> bool:
-    """Return whether an object is a KA Fracture fragment."""
-    return bool(
-        obj.name.startswith("KA_Fracture_Piece_")
-        or any(bool(obj.get(tag, False)) for tag in FRACTURE_TAGS)
-    )
 
 
 GROUND_OBJECT_NAME = "KA_Physics_Ground"
@@ -1182,18 +1170,12 @@ def _directional_hull_error(complete: Sequence[Vector], simplified: Sequence[Vec
     return maximum, rms
 
 
-def _hull_quality_settings(world, *, fracture_piece: bool = False) -> Dict[str, object]:
+def _hull_quality_settings(world) -> Dict[str, object]:
     preset = str(getattr(world, "hull_quality_preset", "BALANCED")) if world else "BALANCED"
     adaptive = bool(getattr(world, "adaptive_hull_accuracy", True)) if world else True
-    separation_inset = (
-        max(0.0, float(getattr(world, "fracture_hull_inset", 0.001)))
-        if fracture_piece else 0.0
-    )
     common = {
         "adaptive": adaptive,
-        "algorithm": "SUPPORT_ERROR_V3_FRACTURE_INSET",
-        "separation_inset": separation_inset,
-        "fracture_piece": bool(fracture_piece),
+        "algorithm": "SUPPORT_ERROR_V4_GENERIC",
     }
     if preset == "FAST":
         return {**common, "preset": preset, "minimum": 24, "maximum": 40, "rescue_maximum": 96, "absolute_tolerance": 0.0015, "relative_tolerance": 0.012, "precision_rescue": True}
@@ -1303,29 +1285,6 @@ def _adaptive_convex_hull_data(
     }
 
 
-def _inset_hull_points(
-    points: Sequence[Vector],
-    center: Vector,
-    requested_inset: float,
-) -> Tuple[List[Vector], float]:
-    """Shrink a hull around its physical center to separate touching fragments."""
-    amount = max(0.0, float(requested_inset))
-    if amount <= 0.0 or not points:
-        return [point.copy() for point in points], 0.0
-    result: List[Vector] = []
-    maximum_applied = 0.0
-    for point in points:
-        delta = point - center
-        length = delta.length
-        if length <= 1.0e-12:
-            result.append(point.copy())
-            continue
-        applied = min(amount, length * 0.12)
-        maximum_applied = max(maximum_applied, applied)
-        result.append(center + delta * ((length - applied) / length))
-    return result, maximum_applied
-
-
 def _cached_convex_hull_data(
     geometry: Dict,
     quality: Dict[str, object],
@@ -1373,13 +1332,8 @@ def _cached_convex_hull_data(
             "characteristic_length": characteristic_length, "precision_rescue": False,
             "rescue_mode": "disabled",
         }
-    requested_inset = max(0.0, float(quality.get("separation_inset", 0.0)))
-    points, applied_inset = _inset_hull_points(points, center, requested_inset)
-    metrics["separation_inset_requested"] = requested_inset
-    metrics["separation_inset_applied"] = float(applied_inset)
-    metrics["fracture_piece"] = bool(quality.get("fracture_piece", False))
     metrics["preset"] = quality.get("preset", "CUSTOM")
-    metrics["algorithm"] = quality.get("algorithm", "SUPPORT_ERROR_V3_FRACTURE_INSET")
+    metrics["algorithm"] = quality.get("algorithm", "SUPPORT_ERROR_V4_GENERIC")
     metrics["absolute_tolerance"] = float(quality.get("absolute_tolerance", 0.0))
     metrics["relative_tolerance"] = float(quality.get("relative_tolerance", 0.0))
     metrics["tolerance"] = float(metrics.get("effective_tolerance", quality.get("absolute_tolerance", 0.0)))
@@ -1870,6 +1824,44 @@ def _cached_compound_data(
         return [dict(part) for part in cached.get("parts", [])], dict(cached.get("quality", {}))
 
     _profile_add(profile, "compound_cache_misses", 1)
+    safe_interior_mode = str(COACD_EXECUTION_MODE).startswith("SAFE_INTERIOR")
+    if safe_interior_mode:
+        # The Windows-safe decomposition creates contained boxes rather than
+        # collision-covering hulls. Do not spend time generating a proxy that
+        # is guaranteed to be rejected for visible dynamic contact.
+        requested_inset = max(0.0, float(resolved.get("inset", 0.0005)))
+        effective_inset = min(requested_inset, 0.00025, characteristic_length * 0.001)
+        source_volume = max(0.0, float(geometry.get("volume_world", 0.0)))
+        quality = {
+            "algorithm": resolved.get("algorithm"),
+            "coacd_version": COACD_VERSION,
+            "preset": resolved.get("preset", "BALANCED"),
+            "part_count": 0,
+            "max_parts": int(resolved.get("max_parts", 8)),
+            "max_hull_vertices": int(resolved.get("max_hull_vertices", 96)),
+            "threshold": float(resolved.get("threshold", 0.003)),
+            "absolute_tolerance": float(resolved.get("absolute_tolerance", 0.003)),
+            "relative_tolerance": float(resolved.get("relative_tolerance", 0.005)),
+            "characteristic_length": characteristic_length,
+            "source_volume": source_volume,
+            "part_volume": 0.0,
+            "part_to_source_volume_ratio": 0.0 if source_volume > 1.0e-12 else None,
+            "runtime_proxy_volume": 0.0,
+            "runtime_proxy_to_source_volume_ratio": 0.0 if source_volume > 1.0e-12 else None,
+            "conservative_interior_proxy": True,
+            "inset_requested": requested_inset,
+            "inset": effective_inset,
+            "accepted": False,
+            "fallback_reason": "safe_interior_proxy_disabled_for_dynamic_contact",
+            "fallback_reasons": ["safe_interior_proxy_disabled_for_dynamic_contact"],
+            "seconds": 0.0,
+            "runtime_representation": "SINGLE_HULL_FALLBACK",
+            "native_compound_pending": True,
+            "coacd_execution": COACD_EXECUTION_MODE,
+        }
+        compounds[cache_key] = {"parts": [], "quality": quality}
+        return [], dict(quality)
+
     started = time.perf_counter()
     raw_vertices = list(geometry.get("vertices", []))
     raw_indices = [int(value) for value in geometry.get("indices", [])]
@@ -1877,7 +1869,13 @@ def _cached_compound_data(
     error: Optional[str] = None
     try:
         native_parts = coacd_decompose(raw_vertices, raw_indices, resolved)
-        inset = float(resolved.get("inset", 0.0005))
+        requested_inset = max(0.0, float(resolved.get("inset", 0.0005)))
+        # A fixed inset becomes a large geometric error on small fracture pieces.
+        # Cap it to 0.1% of the collider diagonal (and 0.25 mm) so adjacent
+        # fragments still separate without visibly shrinking the contact shell.
+        inset = min(requested_inset, 0.00025, characteristic_length * 0.001)
+        resolved["requested_inset"] = requested_inset
+        resolved["effective_inset"] = inset
         for native in native_parts[: int(resolved.get("max_parts", 8))]:
             source_points = [Vector(value) for value in native.get("vertices", [])]
             source_indices = [int(value) for value in native.get("indices", [])]
@@ -1937,8 +1935,16 @@ def _cached_compound_data(
     quality_reasons: List[str] = []
     if error:
         quality_reasons.append(error)
-    if safe_interior_mode and runtime_proxy_ratio is not None and runtime_proxy_ratio > 1.02:
-        quality_reasons.append(f"safe_proxy_overfill:{runtime_proxy_ratio:.6g}")
+    if safe_interior_mode:
+        # Interior-only boxes are deliberately smaller than the authored mesh.
+        # They are useful for conservative containment queries but invalid as a
+        # visible dynamic collider: the solver can rest the proxy on the floor
+        # while the render mesh penetrates deeply. Never accept this path for a
+        # production Compound Convex body; the caller falls back to the complete
+        # single convex hull, which guarantees outer-surface coverage.
+        quality_reasons.append("safe_interior_proxy_disabled_for_dynamic_contact")
+        if runtime_proxy_ratio is not None:
+            quality_reasons.append(f"safe_proxy_volume_ratio:{runtime_proxy_ratio:.6g}")
         parts = []
     quality = {
         "algorithm": resolved.get("algorithm"),
@@ -1957,12 +1963,15 @@ def _cached_compound_data(
         "runtime_proxy_volume": float(runtime_proxy_volume),
         "runtime_proxy_to_source_volume_ratio": runtime_proxy_ratio,
         "conservative_interior_proxy": bool(safe_interior_mode),
-        "inset": float(resolved.get("inset", 0.0)),
+        "inset_requested": float(resolved.get("requested_inset", resolved.get("inset", 0.0))),
+        "inset": float(resolved.get("effective_inset", resolved.get("inset", 0.0))),
         "accepted": bool(parts),
         "fallback_reason": (quality_reasons[0] if quality_reasons else None),
         "fallback_reasons": quality_reasons,
         "seconds": float(elapsed),
-        "runtime_representation": "NATIVE_CONVEX_OR_CONSERVATIVE_INTERIOR_BOX_COMPOUND",
+        "runtime_representation": (
+            "NATIVE_CONVEX_COMPOUND" if parts else "SINGLE_HULL_FALLBACK"
+        ),
         "native_compound_pending": True,
         "coacd_execution": COACD_EXECUTION_MODE,
     }
@@ -2016,7 +2025,7 @@ def object_to_body_dict(
     compound_quality_metrics: Dict[str, object] = {}
     raw_hull_vertex_count = 0
     hull_quality_metrics: Dict[str, object] = {}
-    hull_quality = _hull_quality_settings(world, fracture_piece=is_ka_fracture_piece(obj))
+    hull_quality = _hull_quality_settings(world)
 
     # Compound Convex always keeps a single-hull fallback in the payload. This
     # makes a failed decomposition safe and also gives diagnostics a direct
@@ -2111,19 +2120,17 @@ def object_to_body_dict(
     if body_type != "DYNAMIC":
         ccd_effective = False
         ccd_reason = "non_dynamic"
-    elif world is not None and bool(world.adaptive_ccd) and ccd_requested:
-        speed = _initial_speed(settings)
-        small_enough = radius <= max(1.0e-5, float(world.ccd_max_radius))
-        fast_enough = speed >= max(0.0, float(world.ccd_speed_threshold))
-        ccd_effective = small_enough or fast_enough
-        if small_enough:
-            ccd_reason = "adaptive_small_body"
-        elif fast_enough:
-            ccd_reason = "adaptive_initial_speed"
-        else:
-            ccd_reason = "adaptive_not_required"
     elif not ccd_requested:
+        ccd_effective = False
         ccd_reason = "disabled_on_body"
+    elif world is not None and bool(world.adaptive_ccd):
+        # Jolt's LinearCast motion quality performs its own per-step thresholding.
+        # Gating CCD from the authored start velocity is incorrect for fracture
+        # pieces, which commonly start asleep and receive their speed from a later
+        # impact. Keep LinearCast armed from frame one and let Jolt decide whether
+        # an actual cast is required for each step.
+        ccd_effective = True
+        ccd_reason = "jolt_adaptive_linear_cast"
 
     body = {
         "stable_id": ensure_stable_id(obj, BODY_ID_PROPERTY),
@@ -2138,6 +2145,7 @@ def object_to_body_dict(
         "shape_center": _vector_list(shape_center),
         "half_extents": _vector_list(half_extents_vector),
         "radius": float(radius),
+        "minimum_feature_length": float(max(1.0e-5, 2.0 * min(abs(float(v)) for v in half_extents_vector))),
         "mass": float(effective_mass),
         "raw_mass": float(raw_mass),
         "mass_mode": settings.mass_mode,
@@ -2215,6 +2223,7 @@ def preflight_scene(scene: bpy.types.Scene, *, auto_fix: bool = False) -> Dict:
         "mass_ratio": None,
         "mass_ratio_before": None,
         "mass_conditioning_floor": None,
+        "constraint_count": 0,
         "ground_objects": [],
         "duplicate_static_groups": [],
         "excluded_static_duplicates": [],
@@ -2321,7 +2330,7 @@ def preflight_scene(scene: bpy.types.Scene, *, auto_fix: bool = False) -> Dict:
     result["body_count"] = len(bodies)
     result["ground_objects"] = [obj.name_full for obj in ground_objects(scene, enabled_only=True)]
 
-    dynamic_masses: List[float] = []
+    dynamic_mass_bodies: List[Dict[str, object]] = []
     names = set()
     for obj in bodies:
         settings = obj.ka_rigid_body
@@ -2370,7 +2379,13 @@ def preflight_scene(scene: bpy.types.Scene, *, auto_fix: bool = False) -> Dict:
         if world.small_body_policy == "SKIP" and is_small:
             continue
         effective_mass = max(raw_mass, minimum_mass) if world.small_body_policy == "STABILIZE" else raw_mass
-        dynamic_masses.append(effective_mass)
+        dynamic_mass_bodies.append({
+            "name": obj.name_full,
+            "stable_id": ensure_stable_id(obj, BODY_ID_PROPERTY),
+            "body_type": "DYNAMIC",
+            "mass": float(effective_mass),
+            "stability_adjustments": [],
+        })
 
         if settings.mass_mode == "DENSITY":
             volume = float(geometry.get("volume_world", 0.0))
@@ -2382,79 +2397,82 @@ def preflight_scene(scene: bpy.types.Scene, *, auto_fix: bool = False) -> Dict:
     if int(result["static_count"]) == 0:
         warnings.append("No static or kinematic collider is enabled.")
 
-    if len(dynamic_masses) >= 2:
-        smallest = min(dynamic_masses)
-        largest = max(dynamic_masses)
-        ratio_before = largest / max(1.0e-12, smallest)
-        ratio = ratio_before
-        result["mass_ratio_before"] = ratio_before
-        limit = max(10.0, float(world.max_mass_ratio))
-        conditioning = (
-            str(world.small_body_policy) == "STABILIZE"
-            and bool(getattr(world, "enforce_mass_ratio_limit", True))
+    constraint_errors, constraint_warnings = validate_constraints(scene, bodies)
+    result["constraint_count"] = len([
+        obj for obj in scene.objects
+        if hasattr(obj, "ka_rigid_constraint") and obj.ka_rigid_constraint.enabled
+    ])
+    errors.extend(constraint_errors)
+    warnings.extend(constraint_warnings)
+    if int(result["constraint_count"]) and world.backend != "JOLT":
+        warnings.append("Authored Rope/Rod constraints require Jolt; Bake will select Jolt automatically.")
+
+    if len(dynamic_mass_bodies) >= 2:
+        preview_constraints = (
+            bonds_for_enabled_bodies(
+                scene,
+                (str(body.get("stable_id", "")) for body in dynamic_mass_bodies),
+            )
+            if bool(getattr(world, "bond_enabled", True))
+            else []
         )
-        if conditioning and ratio_before > limit:
-            floor = max(float(world.minimum_dynamic_mass), largest / limit)
-            result["mass_conditioning_floor"] = floor
-            ratio = largest / max(floor, smallest)
+        preview = condition_dynamic_mass_ratios(
+            [dict(body) for body in dynamic_mass_bodies],
+            preview_constraints,
+            enabled=(
+                str(world.small_body_policy) == "STABILIZE"
+                and bool(getattr(world, "enforce_mass_ratio_limit", True))
+            ),
+            limit=max(10.0, float(world.max_mass_ratio)),
+            absolute_floor=max(1.0e-6, float(world.minimum_dynamic_mass)),
+        )
+        result["mass_ratio_before"] = float(preview.get("ratio_before", 0.0))
+        result["mass_ratio"] = float(preview.get("ratio_after", 0.0))
+        result["mass_conditioning_floor"] = float(preview.get("mass_floor", 0.0)) or None
+        ratio_before = float(preview.get("ratio_before", 0.0))
+        ratio_after = float(preview.get("ratio_after", ratio_before))
+        mode = str(preview.get("mode", "GLOBAL"))
+        adjusted = int(preview.get("adjusted_bodies", 0))
+        if adjusted:
             warnings.append(
-                f"Dynamic mass ratio {ratio_before:.1f}:1 will be conditioned to approximately "
-                f"{ratio:.1f}:1 using a solver-only mass floor of {floor:.6g} kg."
+                f"Dynamic mass ratio {ratio_before:.1f}:1 uses {mode.lower().replace('_', ' ')} "
+                f"conditioning for {adjusted} bodies. Independent impactors retain their authored mass; "
+                f"maximum internal component ratio after conditioning is "
+                f"{float(preview.get('max_component_ratio_after', 0.0)):.1f}:1."
             )
-        elif ratio_before > limit:
+        elif ratio_before > max(10.0, float(world.max_mass_ratio)):
             warnings.append(
-                f"Dynamic mass ratio is {ratio_before:.1f}:1 ({smallest:.6g} to {largest:.6g} kg), "
-                f"above the configured limit {limit:.1f}:1."
+                f"Global dynamic mass ratio is {ratio_before:.1f}:1 and remains {ratio_after:.1f}:1. "
+                "Independent impactors are no longer allowed to inflate the solver mass of a bonded structure."
             )
-        result["mass_ratio"] = ratio
+
 
     return result
 
 
-def _condition_dynamic_mass_ratios(bodies: Sequence[Dict], world, profile: Optional[Dict] = None) -> Dict[str, float]:
-    """Condition solver-only masses without changing source object settings.
+def _condition_dynamic_mass_ratios(
+    bodies: Sequence[Dict],
+    world,
+    profile: Optional[Dict] = None,
+    constraints: Optional[Sequence[Dict]] = None,
+) -> Dict[str, object]:
+    """Apply component-aware solver mass conditioning.
 
-    Extremely small fragments coupled to heavy bodies produce poorly conditioned
-    contact islands. In STABILIZE mode, raise only the simulation mass floor so
-    the global dynamic ratio remains bounded.
+    Independent impactors must not inflate every mass in a bonded structure.
+    Conditioning therefore stays inside Dynamic-Dynamic bond components when
+    such a graph exists, while loose scenes retain the legacy global mode.
     """
-    dynamic = [
-        body for body in bodies
-        if body.get("body_type") == "DYNAMIC" and not body.get("skip_simulation")
-    ]
-    summary = {"enabled": False, "largest_mass": 0.0, "mass_floor": 0.0, "adjusted_bodies": 0, "ratio_before": 0.0, "ratio_after": 0.0}
-    if not dynamic:
-        return summary
-    masses = [max(1.0e-12, float(body.get("mass", 0.0))) for body in dynamic]
-    largest = max(masses)
-    smallest = min(masses)
-    ratio_before = largest / smallest
-    summary.update({"largest_mass": largest, "ratio_before": ratio_before, "ratio_after": ratio_before})
     enabled = (
         str(getattr(world, "small_body_policy", "SIMULATE")) == "STABILIZE"
         and bool(getattr(world, "enforce_mass_ratio_limit", True))
     )
-    if not enabled:
-        return summary
-    limit = max(10.0, float(getattr(world, "max_mass_ratio", 5000.0)))
-    absolute_floor = max(1.0e-6, float(getattr(world, "minimum_dynamic_mass", 0.001)))
-    mass_floor = max(absolute_floor, largest / limit)
-    adjusted = 0
-    for body in dynamic:
-        mass = max(0.0, float(body.get("mass", 0.0)))
-        if mass + 1.0e-12 >= mass_floor:
-            continue
-        body["mass"] = float(mass_floor)
-        adjustments = body.setdefault("stability_adjustments", [])
-        if "mass_ratio_clamped" not in adjustments:
-            adjustments.append("mass_ratio_clamped")
-        adjusted += 1
-    summary.update({
-        "enabled": True,
-        "mass_floor": mass_floor,
-        "adjusted_bodies": adjusted,
-        "ratio_after": largest / max(mass_floor, smallest),
-    })
+    summary = condition_dynamic_mass_ratios(
+        bodies,
+        constraints,
+        enabled=enabled,
+        limit=max(10.0, float(getattr(world, "max_mass_ratio", 5000.0))),
+        absolute_floor=max(1.0e-6, float(getattr(world, "minimum_dynamic_mass", 0.001))),
+    )
     if profile is not None:
         profile["mass_conditioning"] = dict(summary)
     return summary
@@ -2493,7 +2511,21 @@ def build_scene_payload(scene: bpy.types.Scene) -> Dict:
     extraction_started = time.perf_counter()
     extracted = [object_to_body_dict(obj, depsgraph, world, profile) for obj in objects]
     profile["body_extraction_seconds"] = time.perf_counter() - extraction_started
-    mass_conditioning = _condition_dynamic_mass_ratios(extracted, world, profile)
+    candidate_ids = [str(body.get("stable_id", "")) for body in extracted if not body.get("skip_simulation")]
+    bond_constraints = (
+        bonds_for_enabled_bodies(scene, candidate_ids)
+        if bool(getattr(world, "bond_enabled", True))
+        else []
+    )
+    external_constraints = constraints_for_enabled_bodies(
+        scene,
+        [body for body in extracted if not body.get("skip_simulation")],
+    )
+    constraints = sorted(
+        [*bond_constraints, *external_constraints],
+        key=lambda item: str(item.get("stable_id", "")),
+    )
+    mass_conditioning = _condition_dynamic_mass_ratios(extracted, world, profile, constraints)
     skipped = [
         {
             "name": body["name"],
@@ -2505,11 +2537,6 @@ def build_scene_payload(scene: bpy.types.Scene) -> Dict:
         if body.get("skip_simulation")
     ]
     bodies = [body for body in extracted if not body.get("skip_simulation")]
-    constraints = (
-        bonds_for_enabled_bodies(scene, (str(body.get("stable_id", "")) for body in bodies))
-        if bool(getattr(world, "bond_enabled", True))
-        else []
-    )
     gravity = scene.gravity if world.use_scene_gravity else world.gravity
     scene_id = ensure_stable_id(scene, SCENE_ID_PROPERTY)
     payload = {
@@ -2548,8 +2575,6 @@ def build_scene_payload(scene: bpy.types.Scene) -> Dict:
             "max_mass_ratio": float(world.max_mass_ratio),
             "mass_conditioning": mass_conditioning,
             "convex_hull_max_vertices": int(world.convex_hull_max_vertices),
-            "fracture_hull_inset": float(world.fracture_hull_inset),
-            "fracture_friction": float(world.fracture_friction),
             "bond_stability_mode": str(world.bond_stability_mode),
             "adaptive_hull_accuracy": bool(world.adaptive_hull_accuracy),
             "hull_quality_preset": str(world.hull_quality_preset),
@@ -2567,7 +2592,7 @@ def build_scene_payload(scene: bpy.types.Scene) -> Dict:
             "compound_mcts_iterations": int(world.compound_mcts_iterations),
             "compound_inset": float(world.compound_inset),
             "compound_algorithm": f"{COACD_EXECUTION_MODE} / CoACD {COACD_VERSION}",
-            "compound_runtime_representation": "NATIVE_CONVEX_OR_SINGLE_BODY_OBB_COMPOUND",
+            "compound_runtime_representation": "NATIVE_CONVEX_OR_SINGLE_HULL_FALLBACK",
             "adaptive_ccd": bool(world.adaptive_ccd),
             "ccd_max_radius": float(world.ccd_max_radius),
             "ccd_speed_threshold": float(world.ccd_speed_threshold),
@@ -2643,13 +2668,3 @@ def apply_snapshot(snapshot: Dict[str, Dict]) -> int:
         changed += 1
     return changed
 
-
-def fracture_candidates(context: bpy.types.Context) -> List[bpy.types.Object]:
-    selected = [obj for obj in context.selected_objects if obj.type == "MESH"]
-    tagged = [obj for obj in context.scene.objects if obj.type == "MESH" and any(bool(obj.get(tag, False)) for tag in FRACTURE_TAGS)]
-    if tagged:
-        return tagged
-    if selected:
-        return selected
-    active_collection = context.collection
-    return [obj for obj in active_collection.all_objects if obj.type == "MESH"]

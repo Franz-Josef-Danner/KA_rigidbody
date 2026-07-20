@@ -1,10 +1,10 @@
-"""Shared scale-aware stability defaults for fracture simulations."""
+"""Shared scale-aware rigid-body stability defaults."""
 
 from __future__ import annotations
 
 import math
 
-FRACTURE_CONTACT_FRICTION_DEFAULT = 0.20
+LOW_FRICTION_CONTACT_DEFAULT = 0.20
 LEGACY_BODY_FRICTION_DEFAULT = 0.50
 PENETRATION_SLOP_DEFAULT = 0.001
 LEGACY_PENETRATION_SLOP_DEFAULT = 0.005

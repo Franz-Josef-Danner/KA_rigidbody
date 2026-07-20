@@ -1,3 +1,92 @@
+## Version 0.7.16
+
+- Fixed Rope/Distance constraints becoming detached or appearing to switch to another Dynamic body after fracture bonds broke.
+- Rigid bond-cluster rebuilds now preserve independent Dynamic actors such as projectiles and wrecking balls instead of destroying and recreating every Dynamic body in the scene.
+- Authored Distance constraints are explicitly destroyed before an endpoint topology rebuild and recreated from their persistent body IDs immediately afterwards.
+- Stable body IDs are now authoritative during native constraint binding; name fallback is used only for legacy payloads without IDs.
+- Corrected the remaining native constraint budget so rigid static-anchor constraints are no longer counted twice.
+- Added diagnostics for preserved external Dynamic bodies and Distance-constraint rebinds.
+- Added `Distance rope survives bond rebuild`; the complete native regression suite now passes 40 of 40 tests.
+- Raised the simulation signature schema to 33. Existing simulation caches must be rebuilt; the collider cache remains v8.
+
+## Version 0.7.15
+
+- Fixed Blender 5.2 UI errors caused by writing `ka_rigid_constraint_id` while the Rope Constraints panel was drawing.
+- Constraint enumeration and counting are now strictly read-only. Persistent constraint IDs are created only in writable operator or bake/export contexts.
+- Rope creation now assigns body and constraint IDs immediately.
+- Cache and scene-settings compatibility remain at 0.7.14; this UI hotfix does not require a rebake by itself.
+
+## Version 0.7.14
+
+- Added a real Culverin `Distance rope constraint` regression; the complete suite now contains 39 tests.
+- Added authored `Rope` and `Rod` Distance constraints between enabled KA bodies.
+- Added `Anchor Rope at Cursor`, which creates a small non-colliding Static anchor at the 3D cursor and connects it to the active Dynamic body.
+- Rope mode uses `minimum distance = 0` and `maximum distance = length`; Rod mode uses equal minimum and maximum lengths.
+- Constraint length can follow the current native body-center distance at every bake or be stored as a fixed authored value.
+- `SimulationScene v1`, preflight validation, cache signatures and Jolt diagnostics now include Distance constraints. Constraint scenes automatically select the bundled Culverin/Jolt path because ABI-v2 does not yet expose external joints.
+- Authored Distance constraints use the native capacity remaining after existing compound and bond constraints within Culverin's 256-constraint world limit.
+- Raised add-on, migration and signature schema to 0.7.14 / schema 32. Existing simulation caches must be rebuilt; the collider cache remains v8.
+
+## Version 0.7.13
+
+- Extreme-mass stabilization is now component-aware when authored Dynamic-Dynamic bonds exist. Each bonded target island is conditioned internally, while independent impactors retain their authored solver mass instead of silently scaling the target with them.
+- Breakable-bond loading now combines the raw Jolt contact impulse with pre-solver relative contact-point momentum. Heavy or fast projectiles therefore transfer appropriately larger loads even when Culverin's reported contact impulse is capped or nearly mass-invariant.
+- Rigid island rebuilds preserve the post-impact pose and velocity after overloaded bonds break, so released fragments no longer appear to open and then snap back under still-intact Static anchors.
+- `BOND_BREAK` diagnostics now include `effective_impulse`, `momentum_impulse`, `reduced_mass`, and pre-step/raw relative normal speeds. The reported force model is `MASS_AWARE_CONTACT_MOMENTUM_V3`.
+- Added `Bond-component mass conditioning` and `Mass-aware dense anchor release` regressions. The complete suite passes 38 of 38 tests.
+- Raised add-on, migration and signature schema to 0.7.13 / schema 31. Existing simulation caches must be rebuilt; the collider cache format remains v8.
+
+## Version 0.7.12
+
+- Intact Rigid islands with a Dynamic-Static anchor now also suppress contacts against unbonded Static neighbours whose authored actor AABBs already overlap the island's complete outer convex hull. This removes the remaining frame-2 jump caused by neighbouring Static support fragments.
+- The additional exclusions exist only while the dynamic actor retains at least one intact Static anchor. Collision is rebuilt and restored automatically after the last anchor breaks.
+- Added diagnostics for `bond_static_anchor_initial_overlap_pairs` and included those pairs in the requested/filtered anchor-contact totals.
+- Added the `Rigid Static anchor neighbouring support rest` regression, reproducing the residual unbonded-neighbour depenetration and verifying zero displacement after the fix.
+- Raised add-on, migration and signature schema to 0.7.12 / schema 30. Existing simulation caches must be rebuilt; the collider cache format remains v8.
+
+## Version 0.7.11
+
+- Intact Rigid Dynamic-Static anchor pairs no longer collide with each other while their Fixed bond is active. This prevents Jolt's contact solver from fighting the anchor constraint and shifting the authored assembly on frame 2.
+- Collision filtering uses one dedicated category bit per anchored dynamic actor, preserving the Static body's collisions with every unrelated body. Filters are rebuilt after bond breaks, restoring normal collision immediately.
+- Added diagnostics for requested/filtered anchor pairs, filtered dynamic actors, category-bit overflow and filter rebuilds.
+- Added the `Rigid Static anchor authored pose` regression, reproducing a 15.9 cm start displacement in the previous build and verifying 0.0 mm displacement after the fix.
+- Raised add-on, migration and signature schema to 0.7.11 / schema 29. Existing simulation caches must be rebuilt; the collider cache may remain.
+
+## Version 0.7.10
+
+- Removed the complete automatic KA Fracture integration from the rigid-body add-on: no name/tag recognition, import operator, special density/friction defaults or fragment-only hull inset remain.
+- Moved `Breakable Cohesion` into its own generic panel. Bonds continue to work for arbitrary Dynamic and Static meshes.
+- Added a clear `Dimensions & Mass` section to `Selected Body`, including editable Blender dimensions/scale and fixed-mass or density mode.
+- Raised add-on, migration and signature schema to 0.7.10 / schema 28. Existing simulation and collider caches must be rebuilt.
+
+## Version 0.7.9
+
+- Added native Fixed constraints for intact Dynamic-Static bonds in Rigid cohesion mode.
+- Rigid island rebuilds now recreate surviving static anchors and remove them when their bond breaks.
+- Static-anchor damage reads impacts from the complete rigid island, so remote impacts load the support connection.
+- Selected Only bond generation can explicitly include the managed ground.
+- Bond generation now reports Dynamic-Dynamic and Dynamic-Static counts and warns when a mixed selection produced no anchor.
+- Added the `Rigid Dynamic-Static anchor` regression. Add-on, manifest, migration and signature schema were raised to 0.7.9 / schema 27.
+
+## Version 0.7.8
+
+- Native Jolt convex hulls now set `mMaxConvexRadius = 0`, preserving sharp authored fracture silhouettes at plane contacts instead of using Jolt's default rounded convex radius.
+- The bundled Culverin fallback, whose Python API does not expose the convex-radius setting, now compensates only cached Blender output against managed horizontal ground planes. The native simulation is never teleported.
+- Intact rigid bond clusters receive one shared vertical output correction, preserving exact relative fragment transforms.
+- Compensation is limited to visible sharp-hull penetration beyond 0.1 mm and includes a capped collider-fit margin of at most 5 mm. Arbitrary static meshes and user-authored tilted planes are unaffected.
+- Bake diagnostics report whether compensation is enabled, corrected frames and bodies, and the maximum correction.
+- Added the `Sharp convex hull managed-ground contact` regression. Add-on, manifest, migration and signature schema were raised to 0.7.8 / schema 26.
+
+## Version 0.7.7
+
+- Dynamic collision fallbacks no longer accept conservative interior-box compounds. When the optional native convex-compound bridge is unavailable, the complete fitted convex hull is used instead so the visible mesh cannot extend far outside an undersized runtime collider.
+- Intact `Rigid` bond components now use one component-wide outer convex hull assembled from the authored child collider support points. The former interior sphere/box cloud path was removed from production contact generation.
+- Compound inset is now capped by object scale to avoid eroding small fragments by a disproportionate fixed distance.
+- Adaptive CCD no longer depends on start-frame velocity. Every requested dynamic CCD body is armed with Jolt `LinearCast`; Jolt decides internally when a cast is necessary during motion.
+- Adaptive substeps now account for angular surface travel in addition to linear velocity and gravity, using the smallest relevant collider feature length as the step target.
+- Collider cache format was raised to `KACL8` / `ka_rigid_colliders_v8.kahc`; existing collider and simulation caches must be cleared and rebuilt.
+- Add-on, manifest, migration and signature schema were raised to 0.7.7 / schema 25. The native Culverin regression suite passes 32 of 32 tests.
+
 ## Version 0.7.6
 
 - Zero-velocity `Rigid` bond islands that are already supported by a managed horizontal ground plane now start deactivated at their exact authored pose instead of settling under gravity before native sleep.

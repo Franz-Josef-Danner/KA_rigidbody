@@ -8,6 +8,7 @@ from bpy.types import Panel
 from .backends import BACKEND_CLASSES
 from .operators import addon_preferences
 from .core.coacd_bridge import coacd_status
+from .core.constraints import constraint_count
 
 
 class KA_RIGID_PT_world(Panel):
@@ -179,8 +180,6 @@ class KA_RIGID_PT_stability(Panel):
             hull.label(text="Accurate: 64–128 support points; still one convex shell.", icon="INFO")
         else:
             hull.label(text="Balanced: 32–64 support points with precision rescue.", icon="INFO")
-        hull.prop(world, "fracture_hull_inset")
-        hull.label(text="Applied only to recognized KA Fracture pieces.", icon="INFO")
 
         compound = collider.box()
         compound.label(text="Compound Convex", icon="MOD_EXPLODE")
@@ -209,7 +208,7 @@ class KA_RIGID_PT_stability(Panel):
             compound.label(text="Balanced: up to 8 convex parts, approx. 3 mm target.", icon="INFO")
         compound.label(text="Select Compound Convex directly on bodies that need concave contact.", icon="INFO")
         compound.label(text="CoACD runs in an isolated worker; a bad mesh cannot terminate Blender.", icon="SHIELD")
-        compound.label(text="Without the Jolt bridge, one stable primitive compound is used.", icon="INFO")
+        compound.label(text="Without true convex children, dynamic Compound Convex falls back to one complete convex hull.", icon="INFO")
         compound.label(text="Decomposition is cached; the first bake is slower.", icon="TIME")
 
         small = layout.box()
@@ -227,9 +226,7 @@ class KA_RIGID_PT_stability(Panel):
         ccd.label(text="Continuous Collision", icon="FORCE_FORCE")
         ccd.prop(world, "adaptive_ccd")
         if world.adaptive_ccd:
-            row = ccd.row(align=True)
-            row.prop(world, "ccd_max_radius")
-            row.prop(world, "ccd_speed_threshold")
+            ccd.label(text="Jolt LinearCast stays armed after sleeping bodies are hit.", icon="INFO")
             ccd.label(text="Per-body CCD remains the master enable switch.", icon="INFO")
 
 
@@ -266,9 +263,9 @@ class KA_RIGID_PT_quality(Panel):
             tests.label(text=f"Report: {world.regression_report_path[-80:]}", icon="TEXT")
 
 
-class KA_RIGID_PT_fracture(Panel):
-    bl_label = "KA Fracture Integration"
-    bl_idname = "KA_RIGID_PT_fracture"
+class KA_RIGID_PT_bonds(Panel):
+    bl_label = "Breakable Cohesion"
+    bl_idname = "KA_RIGID_PT_bonds"
     bl_parent_id = "KA_RIGID_PT_world"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
@@ -278,18 +275,8 @@ class KA_RIGID_PT_fracture(Panel):
     def draw(self, context):
         layout = self.layout
         world = context.scene.ka_rigid_world
-        row = layout.row(align=True)
-        row.prop(world, "fracture_density")
-        row.prop(world, "fracture_friction")
-        layout.label(text="Lower friction reduces low-speed side sticking between fragments.", icon="INFO")
-        layout.operator("ka_rigid.import_fracture", icon="MOD_EXPLODE")
-        selected = layout.operator("ka_rigid.import_fracture", text="Selected Meshes Only")
-        selected.selected_only = True
-
-        cohesion = layout.box()
-        cohesion.label(text="Breakable Cohesion", icon="CONSTRAINT")
-        cohesion.prop(world, "bond_enabled")
-        settings = cohesion.column()
+        layout.prop(world, "bond_enabled")
+        settings = layout.column()
         settings.enabled = world.bond_enabled
         settings.prop(world, "bond_stability_mode")
         settings.prop(world, "bond_connection_distance")
@@ -303,9 +290,72 @@ class KA_RIGID_PT_fracture(Panel):
         selected_bonds = row.operator("ka_rigid.generate_bonds", text="Selected Only")
         selected_bonds.selected_only = True
         settings.operator("ka_rigid.clear_bonds", icon="TRASH")
-        settings.label(text="Rigid mode removes visible stretch from intact bond islands.", icon="INFO")
-        settings.label(text="Bonds break from estimated impact load.", icon="INFO")
-        settings.label(text="Bond bakes currently use bundled Culverin instead of ABI-v2.", icon="INFO")
+        settings.label(text="Rigid mode keeps intact bond islands solid.", icon="INFO")
+        settings.label(text="Bonds can connect Dynamic-Dynamic and Dynamic-Static bodies.", icon="INFO")
+
+
+class KA_RIGID_PT_constraints(Panel):
+    bl_label = "Rope Constraints"
+    bl_idname = "KA_RIGID_PT_constraints"
+    bl_parent_id = "KA_RIGID_PT_world"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "KA Physics"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+        layout.label(text=f"Enabled Constraints: {constraint_count(scene)}", icon="CONSTRAINT")
+        row = layout.row(align=True)
+        row.operator("ka_rigid.create_rope_constraint", text="From Selected", icon="LINKED")
+        row.operator("ka_rigid.create_rope_anchor", text="Anchor at Cursor", icon="PIVOT_CURSOR")
+        layout.label(text="Rope limits only the maximum distance.", icon="INFO")
+        layout.label(text="The cursor anchor is Static and does not collide.", icon="INFO")
+
+
+class KA_RIGID_PT_constraint(Panel):
+    bl_label = "Selected Constraint"
+    bl_idname = "KA_RIGID_PT_constraint"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "KA Physics"
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        if obj is None or not hasattr(obj, "ka_rigid_constraint"):
+            return False
+        settings = obj.ka_rigid_constraint
+        return bool(settings.enabled or settings.body_a is not None or settings.body_b is not None)
+
+    def draw(self, context):
+        layout = self.layout
+        obj = context.active_object
+        settings = obj.ka_rigid_constraint
+        layout.label(text=obj.name, icon="CONSTRAINT")
+        layout.prop(settings, "enabled")
+        column = layout.column()
+        column.enabled = settings.enabled
+        column.prop(settings, "constraint_mode")
+        column.prop(settings, "body_a")
+        column.prop(settings, "body_b")
+        column.prop(settings, "use_current_distance")
+        if settings.use_current_distance:
+            if settings.body_a is not None and settings.body_b is not None:
+                distance = float(
+                    (settings.body_b.matrix_world.translation - settings.body_a.matrix_world.translation).length
+                )
+                column.label(text=f"Current center distance: {distance:.4f} m", icon="DRIVER_DISTANCE")
+        else:
+            column.prop(settings, "distance")
+        column.operator("ka_rigid.store_constraint_length", icon="EYEDROPPER")
+        if settings.constraint_mode == "ROPE":
+            column.label(text="Minimum distance: 0 m", icon="INFO")
+        else:
+            column.label(text="Rod mode also transmits compression.", icon="INFO")
+        layout.separator()
+        layout.operator("ka_rigid.delete_constraint", icon="TRASH")
 
 
 class KA_RIGID_PT_body(Panel):
@@ -338,9 +388,17 @@ class KA_RIGID_PT_body(Panel):
             column.label(text="Use only where a Single Hull creates visible gaps.", icon="INFO")
         elif settings.collision_shape == "MESH":
             column.label(text="Exact triangle contact; available only for Static bodies.", icon="INFO")
+        size_mass = column.box()
+        size_mass.label(text="Dimensions & Mass", icon="ARROW_LEFTRIGHT")
+        size_mass.prop(obj, "dimensions")
+        size_mass.prop(obj, "scale")
         if settings.body_type == "DYNAMIC":
-            column.prop(settings, "mass_mode")
-            column.prop(settings, "mass" if settings.mass_mode == "MASS" else "density")
+            size_mass.prop(settings, "mass_mode")
+            size_mass.prop(settings, "mass" if settings.mass_mode == "MASS" else "density")
+            if settings.mass_mode == "DENSITY":
+                size_mass.label(text="Mass is calculated from evaluated mesh volume at bake time.", icon="INFO")
+        else:
+            size_mass.label(text="Static bodies have no simulated mass.", icon="INFO")
         material = column.box()
         material.label(text="Material")
         row = material.row(align=True)
@@ -367,7 +425,9 @@ CLASSES = (
     KA_RIGID_PT_world,
     KA_RIGID_PT_stability,
     KA_RIGID_PT_quality,
-    KA_RIGID_PT_fracture,
+    KA_RIGID_PT_bonds,
+    KA_RIGID_PT_constraints,
+    KA_RIGID_PT_constraint,
     KA_RIGID_PT_body,
 )
 

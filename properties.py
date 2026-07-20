@@ -12,10 +12,7 @@ from bpy.props import (
 )
 from bpy.types import AddonPreferences, PropertyGroup
 
-from .core.stability_defaults import (
-    FRACTURE_CONTACT_FRICTION_DEFAULT,
-    PENETRATION_SLOP_DEFAULT,
-)
+from .core.stability_defaults import PENETRATION_SLOP_DEFAULT
 
 
 _COLLISION_SHAPE_ITEMS = (
@@ -45,6 +42,14 @@ def _collision_shape_updated(settings, _context) -> None:
         settings.collision_shape = "CONVEX_HULL"
     elif shape == "PLANE" and settings.body_type != "STATIC":
         settings.collision_shape = "CONVEX_HULL"
+
+
+def _constraint_body_poll(_settings, obj) -> bool:
+    return bool(
+        obj is not None
+        and hasattr(obj, "ka_rigid_body")
+        and obj.ka_rigid_body.enabled
+    )
 
 
 class KA_RIGID_AddonPreferences(AddonPreferences):
@@ -208,14 +213,6 @@ class KA_RIGID_WorldSettings(PropertyGroup):
         max=1024,
         description="Initial support-point budget used by adaptive hull generation",
     )
-    fracture_hull_inset: FloatProperty(
-        name="Fracture Separation",
-        default=0.001,
-        min=0.0,
-        soft_max=0.01,
-        unit="LENGTH",
-        description="Shrink KA Fracture convex hulls slightly so initially touching fragments do not remain locked together",
-    )
 
     # Legacy scene fields are kept hidden so older .blend files migrate cleanly.
     compound_mode: EnumProperty(
@@ -330,20 +327,20 @@ class KA_RIGID_WorldSettings(PropertyGroup):
     enforce_mass_ratio_limit: BoolProperty(
         name="Condition Extreme Mass Ratios",
         default=True,
-        description="In Stabilize mode, raise very small simulation masses so the dynamic mass ratio stays within the configured limit",
+        description="In Stabilize mode, condition very small solver masses inside each authored Dynamic-Dynamic bond component; independent projectiles keep their authored mass",
     )
     max_mass_ratio: FloatProperty(
         name="Mass Ratio Limit",
         default=5000.0,
         min=10.0,
         soft_max=100000.0,
-        description="Maximum dynamic mass ratio used by Stabilize mode; source and displayed mesh mass remain unchanged",
+        description="Maximum solver-mass ratio inside each bonded dynamic component; independent bodies are not rescaled and displayed/source masses remain unchanged",
     )
 
     adaptive_ccd: BoolProperty(
         name="Adaptive CCD",
         default=True,
-        description="Use CCD only for bodies that request it and are small or start with high speed",
+        description="Arm Jolt LinearCast for every dynamic body that requests CCD; Jolt performs the expensive cast only when the per-step motion requires it",
     )
     ccd_max_radius: FloatProperty(
         name="CCD Max Radius",
@@ -351,7 +348,7 @@ class KA_RIGID_WorldSettings(PropertyGroup):
         min=0.00001,
         soft_max=1.0,
         unit="LENGTH",
-        description="Requested CCD remains active automatically below this body radius",
+        description="Legacy compatibility value; Jolt now evaluates LinearCast demand per simulation step",
     )
     ccd_speed_threshold: FloatProperty(
         name="CCD Speed Threshold",
@@ -359,7 +356,7 @@ class KA_RIGID_WorldSettings(PropertyGroup):
         min=0.0,
         soft_max=100.0,
         unit="VELOCITY",
-        description="Requested CCD remains active automatically above this initial linear speed",
+        description="Legacy compatibility value; authored start velocity no longer disables later impact CCD",
     )
 
     detailed_contact_diagnostics: BoolProperty(
@@ -405,21 +402,6 @@ class KA_RIGID_WorldSettings(PropertyGroup):
     )
     cache_status: StringProperty(name="Cache Status", default="Not baked")
     cache_signature: StringProperty(options={"HIDDEN"})
-    fracture_density: FloatProperty(
-        name="Fracture Density",
-        description="Default density assigned when importing KA Fracture pieces",
-        default=2400.0,
-        min=0.001,
-        soft_max=10000.0,
-        unit="MASS",
-    )
-    fracture_friction: FloatProperty(
-        name="Fracture Friction",
-        description="Default friction assigned to recognized fracture pieces; lower values reduce low-speed side sticking",
-        default=FRACTURE_CONTACT_FRICTION_DEFAULT,
-        min=0.0,
-        soft_max=1.0,
-    )
     bond_enabled: BoolProperty(
         name="Enable Bonds",
         description="Create breakable Fixed constraints from the persisted bond graph during Jolt bakes",
@@ -516,10 +498,52 @@ class KA_RIGID_BodySettings(PropertyGroup):
     rest_scale: FloatVectorProperty(size=3, default=(1.0, 1.0, 1.0), options={"HIDDEN"})
 
 
+class KA_RIGID_ConstraintSettings(PropertyGroup):
+    enabled: BoolProperty(
+        name="KA Constraint",
+        default=False,
+        description="Include this authored mechanical constraint in the next Jolt bake",
+    )
+    constraint_mode: EnumProperty(
+        name="Mode",
+        items=(
+            ("ROPE", "Rope", "Maximum distance only; transmits tension but no compression"),
+            ("ROD", "Rod", "Fixed distance; behaves like a massless rigid bar"),
+        ),
+        default="ROPE",
+    )
+    body_a: PointerProperty(
+        name="Anchor Body",
+        type=bpy.types.Object,
+        poll=_constraint_body_poll,
+        description="First KA body; normally the Static suspension anchor",
+    )
+    body_b: PointerProperty(
+        name="Swinging Body",
+        type=bpy.types.Object,
+        poll=_constraint_body_poll,
+        description="Second KA body; normally the Dynamic wrecking ball",
+    )
+    use_current_distance: BoolProperty(
+        name="Use Current Distance",
+        default=True,
+        description="Measure the native body-center distance again at bake time",
+    )
+    distance: FloatProperty(
+        name="Length",
+        default=5.0,
+        min=0.00001,
+        soft_max=100.0,
+        unit="LENGTH",
+        description="Maximum rope length or fixed rod length when Current Distance is disabled",
+    )
+
+
 CLASSES = (
     KA_RIGID_AddonPreferences,
     KA_RIGID_WorldSettings,
     KA_RIGID_BodySettings,
+    KA_RIGID_ConstraintSettings,
 )
 
 
@@ -528,9 +552,12 @@ def register_properties() -> None:
         bpy.utils.register_class(cls)
     bpy.types.Scene.ka_rigid_world = PointerProperty(type=KA_RIGID_WorldSettings)
     bpy.types.Object.ka_rigid_body = PointerProperty(type=KA_RIGID_BodySettings)
+    bpy.types.Object.ka_rigid_constraint = PointerProperty(type=KA_RIGID_ConstraintSettings)
 
 
 def unregister_properties() -> None:
+    if hasattr(bpy.types.Object, "ka_rigid_constraint"):
+        del bpy.types.Object.ka_rigid_constraint
     if hasattr(bpy.types.Object, "ka_rigid_body"):
         del bpy.types.Object.ka_rigid_body
     if hasattr(bpy.types.Scene, "ka_rigid_world"):
